@@ -55,9 +55,11 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 
 	m_Order = 0;
 	std::vector<unsigned int> v_pos[3];
-	ArrayLib::ArrayNIJK<int8_t> tanDir("tanDir", numLines);
-	ArrayLib::ArrayNIJK<float> Conductivity("Conductivity", numLines);
-	ArrayLib::ArrayNIJK<float> Thickness("Thickness", numLines);
+	// Full-grid lookup tables are only needed by the CSXCAD fallback path; the
+	// resolved-winner path stores sigma/tau per active cell (see below).
+	ArrayLib::ArrayNIJK<int8_t> tanDir;
+	ArrayLib::ArrayNIJK<float> Conductivity;
+	ArrayLib::ArrayNIJK<float> Thickness;
 
 	CSPrimitives* cs_sheet = NULL;
 	double box[6];
@@ -96,16 +98,30 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 		return tanDir(n,x,y,z);
 	};
 
+	std::vector<float> activeCond, activeThick; // 3 per active cell, in v_pos order
+	if (!geoWinners)
+	{
+		tanDir.Init("tanDir", numLines);
+		Conductivity.Init("Conductivity", numLines);
+		Thickness.Init("Thickness", numLines);
+	}
+
 	if (geoWinners)
 	{
 		unsigned int cur[3] = {0,0,0};
 		bool on = false;
+		float condCell[3] = {0,0,0}, thickCell[3] = {0,0,0};
 		auto flush = [&]() {
 			if (on)
 			{
 				v_pos[0].push_back(cur[0]);
 				v_pos[1].push_back(cur[1]);
 				v_pos[2].push_back(cur[2]);
+				for (int k=0; k<3; ++k)
+				{
+					activeCond.push_back(condCell[k]);
+					activeThick.push_back(thickCell[k]);
+				}
 			}
 			on = false;
 		};
@@ -115,6 +131,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 			{
 				flush();
 				cur[0]=w.x; cur[1]=w.y; cur[2]=w.z;
+				for (int k=0; k<3; ++k) { condCell[k]=0; thickCell[k]=0; }
 			}
 			unsigned int wp[] = {w.x,w.y,w.z};
 			int n = w.n;
@@ -151,9 +168,9 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 			CSPropConductingSheet* cs_prop = dynamic_cast<CSPropConductingSheet*>(cs_sheet->GetProperty());
 			if (cs_prop==NULL)
 				continue;
-			Conductivity(n, wp[0], wp[1], wp[2]) = cs_prop->GetConductivity();
-			Thickness(n, wp[0], wp[1], wp[2]) = cs_prop->GetThickness();
-			if ((Conductivity(n, wp[0], wp[1], wp[2])<=0) || (Thickness(n, wp[0], wp[1], wp[2])<=0))
+			condCell[n] = cs_prop->GetConductivity();
+			thickCell[n] = cs_prop->GetThickness();
+			if ((condCell[n]<=0) || (thickCell[n]<=0))
 			{
 				++zeroSheet[cs_sheet->GetID()];
 				m_Op->SetVV(n,wp[0],wp[1],wp[2], 0 );
@@ -340,15 +357,17 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 		{
 			tpos[0]=pos[0];tpos[1]=pos[1];tpos[2]=pos[2];
 			t_dir = tanDirAt(n, pos[0], pos[1], pos[2]);
-			G0 = Conductivity(n, pos[0], pos[1], pos[2])*Thickness(n, pos[0], pos[1], pos[2]);
-			w0 = 8.0/ G0 / Thickness(n, pos[0], pos[1], pos[2])/MUE0;
+			float sigma = geoWinners ? activeCond[i*3+n] : Conductivity(n, pos[0], pos[1], pos[2]);
+			float tau   = geoWinners ? activeThick[i*3+n] : Thickness(n, pos[0], pos[1], pos[2]);
+			G0 = sigma*tau;
+			w0 = 8.0/ G0 / tau /MUE0;
 			Omega_max = w_stop/w0;
 			for (optParaPos=0;optParaPos<numOptPara;++optParaPos)
 				if (omega_stop[optParaPos]>Omega_max)
 					break;
 			if (optParaPos>=numOptPara)
 			{
-				++tableOverflow[std::make_pair(static_cast<double>(Conductivity(n, pos[0], pos[1], pos[2])), static_cast<double>(Thickness(n, pos[0], pos[1], pos[2])))];
+				++tableOverflow[std::make_pair(static_cast<double>(sigma), static_cast<double>(tau))];
 				optParaPos = numOptPara-1;
 			}
 			v_int_ADE[0][n][i]=0;

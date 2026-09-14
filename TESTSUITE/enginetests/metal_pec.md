@@ -59,7 +59,10 @@ geometries are slower on GPU.
   dual-grid dispatch over the same candidates. Cells whose winner needed CPU
   refinement (or that the extension disables, e.g. inside a PML) still take the
   original decision. Operators/engines without this pass return NULL, so the
-  extensions keep the CSXCAD path unchanged.
+  extensions keep the CSXCAD path unchanged. The conducting-sheet extension
+  also keeps its per-cell build state (sigma, thickness, tangent direction)
+  only for resolved sheet cells instead of three full-grid lookup tables
+  (about 19 GB on a 696M-cell model).
 - One X slab at a time bounds output/candidate memory. Geometry copies occur
   during setup only. New Objective-C++ source uses ARC to release GPU resources.
 - GPU runtime errors and verification mismatches stop the run. Missing device /
