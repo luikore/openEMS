@@ -23,7 +23,9 @@ from metal_fields import h5_arrays, make_model
 
 def fixture(path, kind):
     boundaries = ['PML_4', 'PML_4', 'PEC', 'PEC', 'PEC', 'PEC'] if kind == 'pml' else None
-    make_model(path, (20, 18, 16), 400, nonuniform=False, boundaries=boundaries)
+    frequency = 2e10 if kind == 'thick' else 1e9
+    make_model(path, (20, 18, 16), 400, nonuniform=False, boundaries=boundaries,
+               frequency=frequency)
     tree = ET.parse(path)
     props = tree.find('.//Properties')
 
@@ -36,6 +38,16 @@ def fixture(path, kind):
         box = ET.SubElement(prims, 'Box', Priority='3')
         ET.SubElement(box, 'P1', X='4', Y='4', Z='2')
         ET.SubElement(box, 'P2', X='8', Y='8', Z='6')
+    elif kind == 'thick':
+        # 30 mm "copper" at 20 GHz saturates the ADE optimization table. This
+        # must be reported once with a count, not per Yee component.
+        cs = ET.SubElement(props, 'ConductingSheet', Name='cs',
+                           Conductivity='5.8e7', Thickness='3.0e-2')
+        prims = ET.SubElement(cs, 'Primitives')
+        poly = ET.SubElement(prims, 'Polygon', Priority='3', NormDir='2',
+                             Elevation='5')
+        for x, y in ((2, 2), (17, 2), (17, 15), (2, 15)):
+            ET.SubElement(poly, 'Vertex', X1=str(x), X2=str(y))
     else:
         cs = ET.SubElement(props, 'ConductingSheet', Name='cs',
                            Conductivity='5.8e7', Thickness='3.5e-5')
@@ -115,14 +127,24 @@ def main():
     args = p.parse_args()
     root = Path(tempfile.mkdtemp(prefix='openems-metal-cs-'))
     try:
-        cases = ['external'] if args.model else ['polygon', 'fallback', 'pml']
+        cases = ['external'] if args.model else ['polygon', 'fallback', 'pml', 'thick']
         for kind in cases:
             model = args.model.resolve() if args.model else root / (kind + '.xml')
             if not args.model:
                 fixture(model, kind)
             print(kind, flush=True)
+            logs = {}
             for mode in ('0', 'default'):
-                run(str(Path(args.openems).resolve()), model, mode, root / (kind + '-' + mode))
+                logs[mode] = run(str(Path(args.openems).resolve()), model, mode,
+                                 root / (kind + '-' + mode))
+            if kind == 'fallback':
+                for mode in ('0', 'default'):
+                    if 'fell back to PEC' not in logs[mode]:
+                        raise AssertionError('fallback warning summary missing in ' + mode)
+            if kind == 'thick':
+                for mode in ('0', 'default'):
+                    if 'exceed the ADE optimization table' not in logs[mode]:
+                        raise AssertionError('ADE overflow summary missing in ' + mode)
             compare(root / (kind + '-0'), root / (kind + '-default'))
     finally:
         if args.keep:

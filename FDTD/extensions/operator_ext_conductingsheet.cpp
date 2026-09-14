@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <unordered_map>
 
 using std::cerr;
@@ -63,6 +64,13 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 	int nP, nPP;
 	bool b_pos_on;
 	bool disable_pos;
+
+	// Per-component warnings are counted and reported once per offending primitive
+	// or property. A dense fallback would otherwise write one console line (and
+	// several formatted floats) per Yee component, which can be tens of millions.
+	std::map<std::pair<unsigned int,int>,size_t> dimFallback; // (primitive ID, dimension)
+	std::map<unsigned int,size_t> zeroSheet;                  // primitive ID
+	std::map<std::pair<double,double>,size_t> tableOverflow;  // (conductivity, thickness)
 
 	// The Metal operator may already have resolved the winning MATERIAL|METAL
 	// primitive at every Yee component while mapping PEC. Consume those winners
@@ -126,7 +134,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 				continue;
 			if (cs_sheet->GetDimension()!=2)
 			{
-				cerr << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << cs_sheet->GetDimension() << " found, fallback to PEC!" << endl;
+				++dimFallback[std::make_pair(cs_sheet->GetID(), cs_sheet->GetDimension())];
 				m_Op->SetVV(n,wp[0],wp[1],wp[2], 0 );
 				m_Op->SetVI(n,wp[0],wp[1],wp[2], 0 );
 				++m_Op->m_Nr_PEC[n];
@@ -147,7 +155,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 			Thickness(n, wp[0], wp[1], wp[2]) = cs_prop->GetThickness();
 			if ((Conductivity(n, wp[0], wp[1], wp[2])<=0) || (Thickness(n, wp[0], wp[1], wp[2])<=0))
 			{
-				cerr << "Operator_Ext_ConductingSheet::BuildExtension: Warning: Zero conductivity or thickness detected... fallback to PEC!" << endl;
+				++zeroSheet[cs_sheet->GetID()];
 				m_Op->SetVV(n,wp[0],wp[1],wp[2], 0 );
 				m_Op->SetVI(n,wp[0],wp[1],wp[2], 0 );
 				++m_Op->m_Nr_PEC[n];
@@ -213,7 +221,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 							return false; //sanity check, this should never happen
 						if (cs_sheet->GetDimension()!=2)
 						{
-							cerr << "Operator_Ext_ConductingSheet::BuildExtension: A conducting sheet primitive (ID: " << cs_sheet->GetID() << ") with dimension: " << cs_sheet->GetDimension() << " found, fallback to PEC!" << endl;
+							++dimFallback[std::make_pair(cs_sheet->GetID(), cs_sheet->GetDimension())];
 							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
 							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
 							++m_Op->m_Nr_PEC[n];
@@ -234,7 +242,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 
 						if ((Conductivity(n, pos[0], pos[1], pos[2])<=0) || (Thickness(n, pos[0], pos[1], pos[2])<=0))
 						{
-							cerr << "Operator_Ext_ConductingSheet::BuildExtension: Warning: Zero conductivity or thickness detected... fallback to PEC!" << endl;
+							++zeroSheet[cs_sheet->GetID()];
 							m_Op->SetVV(n,pos[0],pos[1],pos[2], 0 );
 							m_Op->SetVI(n,pos[0],pos[1],pos[2], 0 );
 							++m_Op->m_Nr_PEC[n];
@@ -259,6 +267,15 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 	}
 	}
 
+	// Consolidate the per-component warnings collected above.
+	for (const auto& e : dimFallback)
+		cerr << "Operator_Ext_ConductingSheet::BuildExtension: " << e.second
+		     << " Yee components of conducting-sheet primitive (ID: " << e.first.first
+		     << ") fell back to PEC: primitive dimension is " << e.first.second << ", not 2" << endl;
+	for (const auto& e : zeroSheet)
+		cerr << "Operator_Ext_ConductingSheet::BuildExtension: " << e.second
+		     << " Yee components of conducting-sheet primitive (ID: " << e.first
+		     << ") fell back to PEC: zero conductivity or thickness" << endl;
 	size_t numCS = v_pos[0].size();
 	if (numCS==0)
 		return false;
@@ -331,8 +348,7 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 					break;
 			if (optParaPos>=numOptPara)
 			{
-				cerr << "Operator_Ext_ConductingSheet::BuildExtension(): Error, conductor thickness, conductivity or max. simulation frequency of interest is too high! Check parameter!" << endl;
-				cerr << " --> max f: " << m_f_max << "Hz,  Conductivity: " << Conductivity(n, pos[0], pos[1], pos[2]) << "S/m, Thickness " << Thickness(n, pos[0], pos[1], pos[2])*1e6 << "um" << endl;
+				++tableOverflow[std::make_pair(static_cast<double>(Conductivity(n, pos[0], pos[1], pos[2])), static_cast<double>(Thickness(n, pos[0], pos[1], pos[2])))];
 				optParaPos = numOptPara-1;
 			}
 			v_int_ADE[0][n][i]=0;
@@ -375,5 +391,12 @@ bool Operator_Ext_ConductingSheet::BuildExtension()
 			}
 		}
 	}
+
+	// Filled by the coefficient loop above, so report it last.
+	for (const auto& e : tableOverflow)
+		cerr << "Operator_Ext_ConductingSheet::BuildExtension: " << e.second
+		     << " Yee components exceed the ADE optimization table (max f: " << m_f_max
+		     << "Hz, Conductivity: " << e.first.first << "S/m, Thickness " << e.first.second*1e6
+		     << "um); check the conducting-sheet parameters" << endl;
 	return true;
 }
