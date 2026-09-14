@@ -7,7 +7,7 @@ if (WITH_MPI)
      )
 endif()
 
-if (APPLE AND WITH_METAL)
+if (WITH_METAL)
   set(METAL_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/engine_metal.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/operator_metal.cpp
