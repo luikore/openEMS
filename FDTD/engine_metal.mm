@@ -678,11 +678,10 @@ void Engine_Metal::Init()
 		NSError* error = nil;
 		NSString* source = [NSString stringWithUTF8String:voltageKernelSource];
 		MTLCompileOptions* options = [MTLCompileOptions new];
-#ifdef OPENEMS_METAL_FAST_MATH
-		options.fastMathEnabled = YES;
-#else
+		// Fast math is always off: it does not make the memory-bound field
+		// updates faster and it would perturb the reproducible bit patterns the
+		// Metal tests rely on.
 		options.fastMathEnabled = NO;
-#endif
 		id<MTLLibrary> library = [m_Metal->device newLibraryWithSource:source options:options error:&error];
 		if (!library)
 			throw MetalError("Metal: failed to compile voltage kernel", error);

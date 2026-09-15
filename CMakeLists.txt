@@ -15,16 +15,16 @@ cmake_minimum_required(VERSION 3.1...3.10)
 PROJECT(openEMS CXX C)
 
 option(WITH_METAL "Use Metal for FDTD field updates on macOS" OFF)
-option(METAL_FAST_MATH "Enable fast math in Metal FDTD kernels" OFF)
+# Fast math for the Metal kernels is deliberately not offered. It does not make
+# the field updates faster (they are memory-bandwidth bound) and it perturbs the
+# reproducible bit patterns the Metal tests rely on, so the shaders always
+# compile with fast math off.
 if(WITH_METAL AND NOT APPLE)
   message(FATAL_ERROR "WITH_METAL is only supported on Apple platforms")
 endif()
 if(WITH_METAL)
   enable_language(OBJCXX)
   add_definitions(-DOPENEMS_WITH_METAL)
-  if(METAL_FAST_MATH)
-    add_definitions(-DOPENEMS_METAL_FAST_MATH)
-  endif()
   find_library(METAL_FRAMEWORK Metal REQUIRED)
   find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 
