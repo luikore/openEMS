@@ -518,9 +518,18 @@ struct Engine_Metal::MetalState
 				return hash;
 			}
 		};
-		// Bound setup memory and dictionary cache footprint; require substantial
-		// reuse. Highly nonuniform meshes quickly fall back to dense reads.
-		const size_t maxRecords = std::min<size_t>(4096, count / 4);
+		// Bound setup memory and dictionary cache footprint; require at least
+		// fourfold reuse. The packed index is a uint16, so 65535 is the format
+		// limit. The old 4096 cap made graded UPML coefficients overflow and fall
+		// back to fully dense reads for the whole operator.
+		size_t maxRecords = std::min<size_t>(65535, count / 4);
+		if (const char* recordSetting = std::getenv("OPENEMS_METAL_COEFF_RECORDS"))
+		{
+			char* end = nullptr;
+			const unsigned long requested = std::strtoul(recordSetting, &end, 10);
+			if (end != recordSetting && requested)
+				maxRecords = std::min<size_t>(std::min<unsigned long>(requested, 65535), count / 4);
+		}
 		if (!maxRecords)
 			return;
 		std::unordered_map<Record, uint16_t, Hash> lookup;
