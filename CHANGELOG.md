@@ -19,6 +19,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- **Apple Metal GPU engine.** `--engine=metal` runs the FDTD field updates, UPML
+  conditioning, the PEC geometry pass and the conducting-sheet ADE on Apple GPUs.
+  Build with `-DWITH_METAL=ON`. See `docs/metal-engine.md`. The SSE and
+  multithreaded engines stay available in the same binary.
 - **SAR calculation reworked.** Averaging is done once for all frequencies
   instead of per frequency, and the calculation is multi-threaded, together
   giving a large speedup. Averaging follows IEEE/IEC 62704-1. The `--autorange`
