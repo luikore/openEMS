@@ -21,7 +21,7 @@ number moved up and patch releases now have somewhere to go.
 
 - **Apple Metal GPU engine.** `--engine=metal` runs the FDTD field updates, UPML
   conditioning, the PEC geometry pass and the conducting-sheet ADE on Apple GPUs.
-  Build with `-DWITH_METAL=ON`. See `docs/metal-engine.md`. The SSE and
+  Build with `-DWITH_METAL=ON`. See `macos/doc/metal-engine.rst`. The SSE and
   multithreaded engines stay available in the same binary.
 - **SAR calculation reworked.** Averaging is done once for all frequencies
   instead of per frequency, and the calculation is multi-threaded, together
@@ -74,6 +74,17 @@ number moved up and patch releases now have somewhere to go.
 
 ### Changed
 
+- **Metal engine diagnostics.** `--engine=metal` now checks for a GPU before
+  operator setup, so a missing device logs the reason and exits instead of
+  running the CPU PEC pass and then aborting. Every fallback (CPU PEC mapping,
+  dense coefficient/UPML dictionaries, unfused pipeline, CPU ADE, full-grid
+  extension tables) now prints what fell back and why.
+- **macOS-only Metal files consolidated under `macos/`.** The engine sources,
+  validation scripts, benchmark and documentation moved out of `FDTD/`, `docs/`
+  and `TESTSUITE/enginetests/` into `macos/src/`, `macos/tests/`, `macos/bench/`
+  and `macos/doc/`. The Metal build (`-DWITH_METAL=ON`) and the validation
+  commands in `macos/doc/metal-engine.rst` were updated; the benchmark script
+  now also reports peak process memory (`RSS[MB]`).
 - **nf2ff result format.** The far field is written as one compound complex
   dataset per frequency, `/nf2ff/E_theta/FD/f{n}`, stored in (theta, phi)
   order — the format every other frequency-domain dump has used since HDF5
