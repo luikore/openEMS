@@ -35,16 +35,16 @@ def run_case(args, label, cells, steps, boundaries, nonuniform=False):
         make_model(model, cells, steps, nonuniform, boundaries, frequency=5e9)
         sse_time, _ = run(args.openems, model, 'sse', root / 'sse')
         cpu_time, cpu_log = run(args.openems, model, 'metal', root / 'cpu',
-                                args.fp64_reference, compress=True, pml=False)
+                                args.fp64_reference, compress=True, pml=False, wavefront=False)
         gpu_time, gpu_log = run(args.openems, model, 'metal', root / 'gpu',
-                                args.fp64_reference, compress=True, pml=True)
+                                args.fp64_reference, compress=True, pml=True, wavefront=False)
         _, dense_log = run(args.openems, model, 'metal', root / 'dense',
-                           args.fp64_reference, compress=False, pml=True)
+                           args.fp64_reference, compress=False, pml=True, wavefront=False)
         old_layout = os.environ.get('OPENEMS_METAL_PML_LAYOUT')
         try:
             os.environ['OPENEMS_METAL_PML_LAYOUT'] = 'scalar'
             _, scalar_log = run(args.openems, model, 'metal', root / 'scalar',
-                                args.fp64_reference, compress=True, pml=True)
+                                args.fp64_reference, compress=True, pml=True, wavefront=False)
         finally:
             if old_layout is None:
                 os.environ.pop('OPENEMS_METAL_PML_LAYOUT', None)
@@ -61,7 +61,7 @@ def run_case(args, label, cells, steps, boundaries, nonuniform=False):
             try:
                 os.environ[setting] = '1' if setting == 'OPENEMS_METAL_SERIAL_COEFFICIENTS' else '0'
                 _, variant_logs[label_variant] = run(args.openems, model, 'metal', root / label_variant,
-                                                     args.fp64_reference, compress=True, pml=True)
+                                                     args.fp64_reference, compress=True, pml=True, wavefront=False)
             finally:
                 if previous is None: os.environ.pop(setting, None)
                 else: os.environ[setting] = previous

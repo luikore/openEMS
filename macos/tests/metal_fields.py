@@ -35,7 +35,8 @@ from CSXCAD import ContinuousStructure
 from openEMS import openEMS
 
 
-def make_model(path, cells, timesteps, nonuniform=False, boundaries=None, frequency=1e9):
+def make_model(path, cells, timesteps, nonuniform=False, boundaries=None, frequency=1e9,
+               stress_sources=False):
     csx = ContinuousStructure()
     fdtd = openEMS(NrTS=timesteps, EndCriteria=0)
     fdtd.SetCSX(csx)
@@ -50,9 +51,23 @@ def make_model(path, cells, timesteps, nonuniform=False, boundaries=None, freque
             lines = count * (lines / count) ** 1.3
         grid.SetLines(axis, lines)
 
-    excite = csx.AddExcitation('excite', 0, [1, 1, 1])
     center = np.asarray(cells, dtype=float) / 2
+    excite = csx.AddExcitation('excite', 0, [1, 1, 1])
     excite.AddBox(center, center + 1)
+    if stress_sources:
+        # Cross several tile boundaries and overlap two source lists so the
+        # diamond tile-local source map preserves addition order exactly.
+        start = np.maximum(1, np.floor(center) - 3)
+        stop = np.minimum(np.asarray(cells) - 1, np.floor(center) + 3)
+        excite.AddBox(start, stop)
+        overlap = csx.AddExcitation('overlap', 0, [-0.25, 0.5, 0.125])
+        overlap.AddBox(start, stop)
+        # Type 2 excites H. Keep it disjoint from the electric boxes because
+        # CSXCAD resolves a single winning excitation property per coordinate.
+        current_stop = np.asarray([max(1, int(center[0]) - 4),
+                                   cells[1] - 2, cells[2] - 2])
+        current = csx.AddExcitation('current', 2, [0.25, -0.125, 0.5])
+        current.AddBox([1, 1, 1], current_stop)
 
     # Exercise nonuniform update coefficients, not only vacuum cells.
     dielectric = csx.AddMaterial('dielectric', epsilon=3.66, kappa=0.02)
@@ -66,7 +81,7 @@ def make_model(path, cells, timesteps, nonuniform=False, boundaries=None, freque
 
 
 def run(binary, model, engine, output, fp64_reference=False, compress=None, pml=None,
-        fused=None):
+        wavefront=None):
     output.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     if fp64_reference:
@@ -75,8 +90,8 @@ def run(binary, model, engine, output, fp64_reference=False, compress=None, pml=
         env['OPENEMS_METAL_COMPRESS'] = '1' if compress else '0'
     if pml is not None:
         env['OPENEMS_METAL_PML'] = '1' if pml else '0'
-    if fused is not None:
-        env['OPENEMS_METAL_FUSED_PIPELINE'] = '1' if fused else '0'
+    if wavefront is not None:
+        env['OPENEMS_METAL_FUSED_PIPELINE'] = '1' if wavefront else '0'
     start = time.perf_counter()
     proc = subprocess.run(
         [binary, str(model), '--engine=' + engine], cwd=output, env=env,
@@ -137,29 +152,30 @@ def run_case(args, cells, timesteps, label):
     root = Path(tempfile.mkdtemp(prefix='openems-metal-fields-'))
     try:
         model = root / 'model.xml'
-        make_model(model, cells, timesteps, args.nonuniform)
+        make_model(model, cells, timesteps, args.nonuniform,
+                   stress_sources=args.stress_sources)
         sse_time, _ = run(args.openems, model, 'sse', root / 'sse')
         metal_time, metal_log = run(args.openems, model, 'metal', root / 'metal',
                                     args.fp64_reference,
                                     True if args.compare_dense else None)
-        if args.compare_fused:
-            _, unfused_log = run(args.openems, model, 'metal', root / 'unfused',
+        if args.compare_wavefront:
+            _, legacy_log = run(args.openems, model, 'metal', root / 'legacy',
                                   args.fp64_reference,
                                   True if args.compare_dense else None,
-                                  fused=False)
-            if 'Metal: fused E/H pipeline: enabled' not in metal_log:
-                raise AssertionError('Fused Metal pipeline was not enabled')
-            if 'Metal: fused E/H pipeline: disabled' not in unfused_log:
-                raise AssertionError('Unfused Metal comparison was not selected')
+                                  wavefront=False)
+            if 'Metal: in-place diamond E/H pipeline: enabled' not in metal_log:
+                raise AssertionError('Diamond Metal pipeline was not enabled')
+            if 'Metal: in-place diamond E/H pipeline: disabled' not in legacy_log:
+                raise AssertionError('Legacy Metal comparison was not selected')
             for field in ('Et.h5', 'Ht.h5'):
-                fused_arrays = h5_arrays(root / 'metal' / field)
-                unfused_arrays = h5_arrays(root / 'unfused' / field)
-                if fused_arrays.keys() != unfused_arrays.keys():
-                    raise AssertionError('Fused/unfused datasets differ')
-                for name in fused_arrays:
-                    a, b = fused_arrays[name], unfused_arrays[name]
+                diamond_arrays = h5_arrays(root / 'metal' / field)
+                undiamond_arrays = h5_arrays(root / 'legacy' / field)
+                if diamond_arrays.keys() != undiamond_arrays.keys():
+                    raise AssertionError('Diamond/legacy datasets differ')
+                for name in diamond_arrays:
+                    a, b = diamond_arrays[name], undiamond_arrays[name]
                     if a.shape != b.shape or a.dtype != b.dtype or a.tobytes() != b.tobytes():
-                        raise AssertionError('Fused/unfused bits differ: ' + field + '/' + name)
+                        raise AssertionError('Diamond/legacy bits differ: ' + field + '/' + name)
         if args.compare_dense:
             if not any(message in metal_log for message in (
                     'Metal: lossless coefficients:',
@@ -189,8 +205,8 @@ def run_case(args, cells, timesteps, label):
                     args.rtol, args.atol)
 
         print('{}: {} x {} x {}, {} timesteps'.format(label, *cells, timesteps))
-        if args.compare_fused:
-            print('  Fused/unfused Metal: bit-identical complete E/H dumps')
+        if args.compare_wavefront:
+            print('  Diamond/legacy Metal: bit-identical complete E/H dumps')
         if args.compare_dense:
             print('  Dense/compressed Metal: bit-identical complete E/H dumps')
             for line in metal_log.splitlines():
@@ -236,10 +252,13 @@ def main():
     parser.add_argument('--keep', action='store_true')
     parser.add_argument('--compare-dense', action='store_true',
                         help='require bit-identical dumps from dense and compressed Metal')
-    parser.add_argument('--compare-fused', action='store_true',
-                        help='require bit-identical dumps from fused and unfused Metal')
+    parser.add_argument('--compare-wavefront', '--compare-fused', dest='compare_wavefront',
+                        action='store_true',
+                        help='require bit-identical dumps from diamond and legacy Metal')
     parser.add_argument('--nonuniform', action='store_true',
                         help='use varying mesh spacings to exercise dictionary fallback')
+    parser.add_argument('--stress-sources', action='store_true',
+                        help='add overlapping sources spanning multiple diamond tiles')
     args = parser.parse_args()
 
     if args.suite:

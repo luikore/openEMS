@@ -77,7 +77,7 @@ bool Operator_Metal::SetupCSXGrid(CSRectGrid* grid)
 {
 	if (!Operator_sse::SetupCSXGrid(grid))
 		return false;
-	// The kernels address the field as packed float4 words (fused update) and as
+	// The kernels address the field as packed float4 words (diamond update) and as
 	// scalar components (excitation, ADE, indexed UPML). Reject a grid the 32-bit
 	// index format cannot cover before the material and coefficient build.
 	const uint64_t zSlots  = ((uint64_t)numLines[2] + 3) / 4;
