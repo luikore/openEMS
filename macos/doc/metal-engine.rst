@@ -16,17 +16,18 @@ Field updates
 
 The GPU advances an in-place space-time diamond wavefront over one E/H field
 pair; no full-grid ping-pong copy is allocated. Each axis is split into
-alternating mountain and valley ranges that contract or expand by one cell per
-E/H half-step. Their Cartesian product gives four independent phases.
+alternating mountain and valley ranges whose faces advance by one cell per E/H
+half-step. Their Cartesian product gives four independent phases.
 
-::
+.. figure:: metal-wavefront.svg
+   :alt: Diamond schedule over one axis. Cell index runs across, half-step runs down. Mountains (blue) shrink and valleys (orange) widen by one cell per half-step; red arrows mark the advancing wavefront; all cells of one colour at a half-step are one parallel dispatch.
 
-   x ->
- t   A A A A E E E E E E B B B B B F F F F F F C C C C C
- |   A A A A A E E E E E B B B B B B F F F F F C C C C C C
- |   A A A A A A E E E E B B B B B B B F F F F C C C C C C C
- v   A A A A A A A E E E B B B B B B B B F F F C C C C C C C
-     \__ mountains A, B, C __/  \__ valleys E, F __/
+   One axis of the diamond schedule. Mountains contract and valleys widen by
+   one cell per half-step, so the two faces of every valley *are* the advancing
+   wavefront (red). All cells of one colour at one half-step belong to a single
+   dispatch and run in parallel: **there is no compute order inside a range.**
+   The only orders are the half-step sequence and the phase sequence. The four
+   real phases are the Cartesian product of this picture over the X and Y axes.
 
 Every threadgroup owns one XY diamond, spans all packed-Z slots, and advances
 up to four timesteps in place. Mountains within a phase are independent, and so
