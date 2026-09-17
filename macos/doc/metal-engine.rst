@@ -7,43 +7,44 @@ enables every Metal feature; there are no per-feature switches. The same binary
 keeps the SSE and multithreaded engines for comparison.
 
 Operator construction, mesh grading, material EC sampling and the coefficient
-build stay on the CPU. For ordinary Cartesian and PEC models, the GPU advances
-an in-place space-time diamond wavefront. It uses one E/H field pair: no
-full-grid ping-pong copy is allocated.
-
-The GPU also executes the PEC / ``MATERIAL|METAL`` geometry pass. Its winners
-remain available to the conducting-sheet and dispersive-material setup code.
-
-Cylindrical and MPI operators are not supported by the Metal engine.
+build stay on the CPU. The GPU also executes the PEC / ``MATERIAL|METAL``
+geometry pass; its winners remain available to the conducting-sheet and
+dispersive-material setup code.
 
 Field updates
 -------------
 
-The X and Y axes are split into alternating mountain and valley tiles. Their
-ranges contract or expand at each E/H half-step according to stencil
-dependencies. The Cartesian product gives four independent phases. Every
-threadgroup owns one XY diamond, spans all packed-Z slots, and advances up to
-four complete timesteps in place. Threads stride over the tile volume and use
-device-memory threadgroup barriers between E, voltage-source, H, and
-current-source work. Separate command encoders provide the global barrier
-between diamond phases; the kernel never uses a grid-wide spin barrier.
+The GPU advances an in-place space-time diamond wavefront over one E/H field
+pair; no full-grid ping-pong copy is allocated. Each axis is split into
+alternating mountain and valley ranges that contract or expand by one cell per
+E/H half-step. Their Cartesian product gives four independent phases.
 
-The shortest XY span is two cells. This leaves enough independent threadgroups
-for large grids while keeping four timesteps of temporal locality. Depths one
-through four are precomputed, so a partial final block remains on the diamond
-path rather than falling back. Schedule and source tables are small auxiliary
-buffers; field storage remains one E/H pair.
+::
 
-Voltage and current sources are assigned to their unique owning tile for every
-local timestep. Source order, overlapping sources, packed-Z lanes, partial edge
-tiles, and boundary values are bit-identical to the explicit two-dispatch Metal
-path.
+   x ->
+ t   A A A A E E E E E E B B B B B F F F F F F C C C C C
+ |   A A A A A E E E E E B B B B B B F F F F F C C C C C C
+ |   A A A A A A E E E E B B B B B B B F F F F C C C C C C C
+ v   A A A A A A A E E E B B B B B B B B F F F C C C C C C C
+     \__ mountains A, B, C __/  \__ valleys E, F __/
 
-UPML, ADE and arbitrary CPU extension hooks have not yet migrated inside the
-diamond wavefront. Such a model aborts before timestep 0 rather than silently
-running the old update path. ``OPENEMS_METAL_FUSED_PIPELINE=0`` is retained as
-an explicit legacy diagnostic override. ``OPENEMS_METAL_FP64_REFERENCE`` also
-requests that legacy diagnostic path. Fast math is always off.
+Every threadgroup owns one XY diamond, spans all packed-Z slots, and advances
+up to four timesteps in place. Mountains within a phase are independent, and so
+are valleys; the host issues one dispatch per phase, so Metal itself provides
+the barrier between them. Inside a tile, threadgroup barriers order E, voltage
+source, H and current source. No grid-wide spin barrier is used.
+
+The shortest XY span is two cells, which keeps enough threadgroups for large
+grids. Depths one through four are precomputed, so a partial final block stays
+on the same path.
+
+Sources are assigned to their owning tile for each local timestep. Ordering,
+overlapping sources, packed-Z lanes, partial edge tiles and boundary values are
+bit-identical to the explicit two-dispatch Metal path.
+
+UPML, ADE and arbitrary CPU extension hooks have not migrated inside the
+wavefront; a normal Metal run needing them aborts before timestep 0. Fast math
+is always off.
 
 PEC and geometry mapping
 ------------------------
@@ -88,25 +89,11 @@ Further behaviour:
 UPML
 ----
 
-UPML is currently available only through the explicit legacy diagnostic update
-(``OPENEMS_METAL_FUSED_PIPELINE=0``). It is never selected automatically for a
-normal Metal run.
-
-* **Indexed layout (default in the legacy diagnostic).** UPML coefficients and fluxes are permuted once
-  into increasing packed-field addresses with a per-component ``uint32`` index.
-  Stepping then does one indexed field access per lane and contiguous auxiliary
-  I/O, with no per-step coordinate math. Reordering the access order is what
-  produces the speedup; specializing integer divisors alone did not.
-* **Scalar layout.** The original no-copy scalar kernel remains as a low-memory
-  fallback; the two layouts must be bit-identical.
-* **In-place reuse.** The operator's coefficient arrays are permuted in place and
-  restored on teardown, so a later CPU or scalar engine sees valid data.
-* **Lossless coefficient dictionaries.** UPML coefficient triples are
-  deduplicated by exact 32-bit pattern; the dense CPU arrays are rebuilt on
-  teardown for the FP64 diagnostic and later CPU engines.
-* The mapping excludes SIMD padding lanes and skips zero-extent regions left by
-  opposing slabs. Hooks keep CPU order (pre reverse priority, post forward) and
-  pending GPU work is completed before any CPU hook, source, probe or dump.
+UPML has not migrated into the diamond wavefront and runs only under the
+explicit legacy diagnostic path, never selected automatically. Its indexed
+layout permutes coefficients and fluxes into packed-field order. Operator
+coefficient arrays are permuted in place and restored on teardown, and lossless
+32-bit dictionaries rebuild the dense CPU arrays for later CPU engines.
 
 Coefficient dictionaries
 ------------------------
@@ -138,49 +125,23 @@ currents (Lorentz, Drude, Debye) likewise require explicit legacy diagnostics.
 Diagnostic overrides
 --------------------
 
-These environment variables exist for A/B testing and debugging. They all default
-to the feature enabled and are not required to use the engine.
+Three variables select alternative paths, and one enables a diagnostic. All
+default to the primary path and are never required.
 
 .. list-table::
    :header-rows: 1
-   :widths: 34 12 54
+   :widths: 42 58
 
    * - Variable
-     - Default
      - Effect
-   * - ``OPENEMS_METAL_PEC``
-     - GPU
-     - ``0`` = CPU PEC mapping, ``verify`` = GPU + CPU compare
-   * - ``OPENEMS_METAL_PML``
-     - on
-     - ``0`` = CPU UPML conditioning
-   * - ``OPENEMS_METAL_PML_LAYOUT``
-     - ``indexed``
-     - ``scalar`` selects the no-copy scalar kernel
-   * - ``OPENEMS_METAL_PML_REUSE``
-     - on
-     - ``0`` stores separate packed copies
-   * - ``OPENEMS_METAL_PML_COMPRESS``
-     - on
-     - ``0`` keeps dense UPML coefficients
-   * - ``OPENEMS_METAL_COMPRESS``
-     - on
-     - ``0`` keeps dense operator coefficients
-   * - ``OPENEMS_METAL_COEFF_RECORDS``
-     - full range
-     - lowers the dictionary limit
-   * - ``OPENEMS_METAL_FUSED_PIPELINE``
-     - on
-     - ``0`` explicitly selects the legacy two-dispatch diagnostic path
-   * - ``OPENEMS_METAL_SERIAL_COEFFICIENTS``
-     - off
-     - ``1`` builds coefficients single-threaded
-   * - ``OPENEMS_METAL_EARLY_EC_FREE``
-     - on
-     - ``0`` keeps EC arrays before extensions
-   * - ``OPENEMS_METAL_FP64_REFERENCE``
-     - off
-     - ``1`` enables the FP64 diagnostic
+   * - ``OPENEMS_METAL_PEC=0`` or ``verify``
+     - whole PEC pass on the CPU, or GPU plus CPU comparison
+   * - ``OPENEMS_METAL_PML=0``
+     - CPU UPML conditioning instead of the GPU kernels
+   * - ``OPENEMS_METAL_FUSED_PIPELINE=0``
+     - explicitly selects the legacy two-dispatch path (UPML, ADE)
+   * - ``OPENEMS_METAL_FP64_REFERENCE=1``
+     - legacy path plus a diagnostic CPU FP64 update reference
 
 Validation
 ----------
@@ -209,18 +170,13 @@ Limitations and fallbacks
 
 The CPU stays the geometry authority wherever a GPU predicate would be
 approximate: those affected PEC queries run through CSXCAD FP64 and are never
-silently dropped. The field-update engine has a stricter contract: a normal
-Metal run either constructs the in-place diamond kernel or aborts before timestep 0.
-It never automatically substitutes the legacy E/H update or a CPU extension
-path. The legacy path exists only behind an explicit diagnostic override.
+silently dropped. A normal Metal run either constructs the in-place diamond
+kernel or aborts before timestep 0; it never substitutes the legacy E/H update
+or a CPU extension path automatically.
 
 Platform and coordinate systems
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-* Metal is macOS-only and built only with ``-DWITH_METAL=ON`` (off by default).
-* A Metal device is required. If missing, openEMS logs the reason and exits
-  before operator setup (material/PEC/coefficient passes are skipped) instead
-  of falling back to the CPU.
 * Cartesian meshes only. For a cylindrical mesh ``SetupOperator()`` selects the
   cylindrical operator regardless of ``--engine``, so ``--engine=metal`` is
   ignored with a warning.
@@ -265,10 +221,7 @@ aborts unless the user explicitly requested the legacy diagnostic.
 
    * - Trigger
      - Behaviour
-   * - no Metal device
-     - logs the reason and exits before operator setup (no PEC/coefficient
-       passes)
-   * - PEC queue/pipeline unavailable but a device exists
+   * - PEC queue/pipeline unavailable
      - whole PEC pass on CPU; field updates still run on the GPU
    * - ``OPENEMS_METAL_PEC=0``, or a non-Cartesian mesh
      - whole PEC pass on CPU
@@ -290,9 +243,6 @@ aborts unless the user explicitly requested the legacy diagnostic.
        diamond wavefront
    * - ``OPENEMS_METAL_FUSED_PIPELINE=0``
      - explicitly runs the legacy two-dispatch diagnostic path
-   * - ``OPENEMS_METAL_PML=0`` or ``OPENEMS_METAL_PML_LAYOUT=scalar`` together
-       with explicit legacy mode
-     - CPU or scalar-UPML diagnostic respectively
    * - ``OPENEMS_METAL_FP64_REFERENCE=1``
      - explicitly selects the legacy path plus diagnostic CPU reference
 
@@ -302,8 +252,6 @@ the speedup. When the geometry winners are unavailable (for example with
 ``OPENEMS_METAL_PEC=0``), the conducting-sheet and dispersive extensions rebuild
 their full-grid state tables instead of the sparse per-cell form, which costs
 far more memory (about 19 GB on a 696M-cell model).
-``CanReleaseECBeforeExtensions`` likewise releases the EC arrays only for exactly
-UPML, excitation and Mur ABC extensions; any other extension keeps them resident.
 
 Accuracy
 ~~~~~~~~
@@ -317,34 +265,7 @@ Accuracy
 Performance
 ~~~~~~~~~~~
 
-* Small or simple geometries are submission-bound and can be slower on the GPU
-  than on SSE.
-* Regular grids compress exceptionally well; no speedup is claimed for real PCB
-  models that hit the dense-coefficient fallback.
-* Performance figures are finite-run measurements, not convergence or SI
-  validation.
-
-Representative M4 Pro measurements (Release, fast math off):
-
-.. list-table::
-   :header-rows: 1
-   :widths: 25 35 40
-
-   * - Feature
-     - Workload
-     - Result
-   * - In-place diamond E/H
-     - PEC, 3.0M cells, 600 steps
-     - 2.30x over legacy Metal stepping; ~3 MB RSS delta
-   * - In-place diamond E/H
-     - PEC, 17.0M cells, 1000 steps
-     - 1.25x over legacy Metal stepping; ~8 MB RSS delta
-   * - Indexed UPML (explicit legacy diagnostic)
-     - 658×664×33 board, 788 steps
-     - ~1.79x stepping, ~1.18x process
-   * - GPU PEC mapping
-     - 60-pair CoSwitch pilot
-     - ~8.7 s → 0.09 s PEC pass, ~10.9 s → 2.3 s setup
-   * - GPU ADE
-     - 240×240×10, 100800 sheet edges
-     - ~1.26x stepping
+Small or simple geometries are submission-bound and can be slower on the GPU
+than on SSE. Regular grids compress exceptionally well; no speedup is claimed
+for real PCB models that hit the dense-coefficient fallback. Measured figures
+and methodology live in ``macos/doc/metal-benchmark.rst``.

@@ -137,11 +137,6 @@ bool Operator_Metal::Calc_EC()
 
 void Operator_Metal::CalcOperatorCoefficients()
 {
-	const char* serial = std::getenv("OPENEMS_METAL_SERIAL_COEFFICIENTS");
-	if (serial && serial[0]=='1') {
-		cout << "Metal: single-threaded coefficient build selected by OPENEMS_METAL_SERIAL_COEFFICIENTS=1" << endl;
-		Operator::CalcOperatorCoefficients(); return;
-	}
 	unsigned int workers = GetSetupThreads();
 	workers = std::min(workers,numLines[0]);
 	// This arithmetic pass touches no CSXCAD geometry: it only reads EC arrays
@@ -177,12 +172,6 @@ void Operator_Metal::CalcOperatorCoefficients()
 
 bool Operator_Metal::CanReleaseECBeforeExtensions() const
 {
-	const char* setting = std::getenv("OPENEMS_METAL_EARLY_EC_FREE");
-	if (setting && setting[0] == '0')
-	{
-		cout << "Metal: keeping EC arrays resident (OPENEMS_METAL_EARLY_EC_FREE=0)" << endl;
-		return false;
-	}
 	// Exact types, not derived types: future extensions must opt into this audit.
 	// In particular series RLC, dispersive and conducting-sheet extensions need EC.
 	for (const auto* extension : m_Op_exts)

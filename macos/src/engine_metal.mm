@@ -182,8 +182,6 @@ struct Engine_Metal::MetalState
 	id<MTLBuffer> coeffIndex;
 	id<MTLComputePipelineState> pmlPrePipeline[2];
 	id<MTLComputePipelineState> pmlPostPipeline[2];
-	bool indexedPML = true;
-	bool reusePML = true;
 	size_t reusedPMLBytes = 0;
 	id<MTLCommandBuffer> pending;
 	bool diamondRequested = true;
@@ -235,14 +233,7 @@ struct Engine_Metal::MetalState
 
 	void CompressPML(PMLRegion& region, unsigned int field)
 	{
-		const char* setting = std::getenv("OPENEMS_METAL_PML_COMPRESS");
-		// Lossless dictionaries substantially reduce resident PML memory. Keep a
-		// dense A/B path for unusual coefficient sets and performance diagnosis.
-		if (setting && setting[0] == '0')
-		{
-			cout << "Metal: dense UPML coefficients selected by OPENEMS_METAL_PML_COMPRESS=0" << endl;
-			return;
-		}
+		// Lossless dictionaries substantially reduce resident PML memory.
 		using Record = std::array<uint32_t, 3>;
 		struct Hash { size_t operator()(const Record& r) const {
 			return ((size_t)r[0]*16777619U ^ r[1])*16777619U ^ r[2];
@@ -383,12 +374,6 @@ struct Engine_Metal::MetalState
 	// arrays for CPU access and the FP64 reference; only GPU reads use this copy.
 	void CompressCoefficients(size_t count)
 	{
-		const char* setting = std::getenv("OPENEMS_METAL_COMPRESS");
-		if (setting && setting[0] == '0')
-		{
-			cout << "Metal: dense operator coefficients selected by OPENEMS_METAL_COMPRESS=0" << endl;
-			return;
-		}
 		using Record = std::array<uint32_t, 48>; // 4 arrays * 3 components * 4 lanes
 		struct Hash
 		{
@@ -404,13 +389,6 @@ struct Engine_Metal::MetalState
 		// fourfold reuse. The packed index is a uint16, so 65536 records
 		// (indices 0..65535) is the format limit.
 		size_t maxRecords = std::min<size_t>(65536, count / 4);
-		if (const char* recordSetting = std::getenv("OPENEMS_METAL_COEFF_RECORDS"))
-		{
-			char* end = nullptr;
-			const unsigned long requested = std::strtoul(recordSetting, &end, 10);
-			if (end != recordSetting && requested)
-				maxRecords = std::min<size_t>(std::min<unsigned long>(requested, 65536), count / 4);
-		}
 		if (!maxRecords)
 		{
 			cout << "Metal: too few positions to compress; using dense operator coefficients" << endl;
@@ -639,18 +617,16 @@ void Engine_Metal::Init()
 		if (!m_Metal->adeApplyPipeline)
 			throw MetalError("Metal: failed to create ADE apply pipeline", error);
 
-		const char* layout = std::getenv("OPENEMS_METAL_PML_LAYOUT");
-		m_Metal->indexedPML = !(layout && std::strcmp(layout, "scalar") == 0);
 		for (unsigned int compressed=0; compressed<2; ++compressed)
 		{
 			MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
 			bool enabled = compressed != 0;
 			[values setConstantValue:&enabled type:MTLDataTypeBool atIndex:1];
-			function = [library newFunctionWithName:m_Metal->indexedPML ? @"upml_indexed_pre" : @"upml_pre" constantValues:values error:&error];
+			function = [library newFunctionWithName:@"upml_indexed_pre" constantValues:values error:&error];
 			if (!function) throw MetalError("Metal: UPML pre kernel specialization failed", error);
 			m_Metal->pmlPrePipeline[compressed] = [m_Metal->device newComputePipelineStateWithFunction:function error:&error];
 			if (!m_Metal->pmlPrePipeline[compressed]) throw MetalError("Metal: UPML pre pipeline failed", error);
-			function = [library newFunctionWithName:m_Metal->indexedPML ? @"upml_indexed_post" : @"upml_post" constantValues:values error:&error];
+			function = [library newFunctionWithName:@"upml_indexed_post" constantValues:values error:&error];
 			if (!function) throw MetalError("Metal: UPML post kernel specialization failed", error);
 			m_Metal->pmlPostPipeline[compressed] = [m_Metal->device newComputePipelineStateWithFunction:function error:&error];
 			if (!m_Metal->pmlPostPipeline[compressed]) throw MetalError("Metal: UPML post pipeline failed", error);
@@ -705,10 +681,6 @@ void Engine_Metal::InitUPML()
 		return;
 	}
 
-	const char* reuseSetting = std::getenv("OPENEMS_METAL_PML_REUSE");
-	m_Metal->reusePML = !(reuseSetting && reuseSetting[0] == '0');
-	if (!m_Metal->reusePML)
-		cout << "Metal: storing separate packed UPML copies (OPENEMS_METAL_PML_REUSE=0, higher memory)" << endl;
 	const NSUInteger pageSize = (NSUInteger)getpagesize();
 	auto wrap = [&](const ArrayLib::ArrayNIJK<FDTD_FLOAT>& array) {
 		const NSUInteger bytes = (array.bytes() + pageSize - 1) / pageSize * pageSize;
@@ -732,7 +704,6 @@ void Engine_Metal::InitUPML()
 		region.extension = pml;
 		region.params = {op->m_StartPos[0], op->m_StartPos[1], op->m_StartPos[2],
 			op->m_numLines[0], op->m_numLines[1], op->m_numLines[2], numLines[1], numVectors};
-		if (m_Metal->indexedPML)
 		{
 			const PMLParams& p = region.params;
 			// The grid index range was validated in Operator_Metal::SetupCSXGrid.
@@ -760,33 +731,20 @@ void Engine_Metal::InitUPML()
 							}
 			if ((size_t)(indices-indicesBegin) != componentCount)
 				throw std::runtime_error("Metal: incomplete UPML index mapping");
-			if (m_Metal->reusePML && m_Metal->reorderScratch.size() < componentCount)
+			if (m_Metal->reorderScratch.size() < componentCount)
 				m_Metal->reorderScratch.resize(componentCount);
 			auto pack = [&](ArrayLib::ArrayNIJK<FDTD_FLOAT>& array, bool restore) {
-				id<MTLBuffer> buffer;
-				float* out;
-				if (m_Metal->reusePML)
-				{
-					buffer = wrap(array);
-					out = m_Metal->reorderScratch.data();
-					// Register before mutation so exception cleanup can restore the operator.
-					if (restore) m_Metal->reordered.push_back({&array, p, region.indices});
-				}
-				else
-				{
-					buffer = [m_Metal->device newBufferWithLength:componentCount * sizeof(float)
-						options:MTLResourceStorageModeShared];
-					if (!buffer) throw std::runtime_error("Metal: failed to allocate packed UPML array");
-					out = static_cast<float*>(buffer.contents);
-				}
+				// Reuse the operator-owned CPU storage in indexed order; CPU UPML
+				// hooks never execute on it during Metal stepping.
+				id<MTLBuffer> buffer = wrap(array);
+				float* out = m_Metal->reorderScratch.data();
+				// Register before mutation so exception cleanup can restore the operator.
+				if (restore) m_Metal->reordered.push_back({&array, p, region.indices});
 				const uint32_t* fieldIndices=static_cast<const uint32_t*>(region.indices.contents);
 				for (size_t i = 0; i < componentCount; ++i)
 					out[i] = array.data()[MetalState::ScalarIndex(p,fieldIndices[i])];
-				if (m_Metal->reusePML)
-				{
-					std::memcpy(array.data(), out, array.bytes());
-					m_Metal->reusedPMLBytes += array.bytes();
-				}
+				std::memcpy(array.data(), out, array.bytes());
+				m_Metal->reusedPMLBytes += array.bytes();
 				return buffer;
 			};
 			region.flux[0] = pack(pml->volt_flux, false);
@@ -798,25 +756,11 @@ void Engine_Metal::InitUPML()
 			region.newFlux[0] = pack(op->vvfn, true);
 			region.newFlux[1] = pack(op->iifn, true);
 		}
-		else
-		{
-			region.flux[0] = wrap(pml->volt_flux);
-			region.flux[1] = wrap(pml->curr_flux);
-			region.self[0] = wrap(op->vv);
-			region.self[1] = wrap(op->ii);
-			region.oldFlux[0] = wrap(op->vvfo);
-			region.oldFlux[1] = wrap(op->iifo);
-			region.newFlux[0] = wrap(op->vvfn);
-			region.newFlux[1] = wrap(op->iifn);
-		}
 		// Register before compressing: CompressPML may release the operator-owned
 		// dense arrays, and RestorePML can only rebuild them from pml.
 		m_Metal->pml.push_back(region);
-		if (m_Metal->indexedPML)
-		{
-			m_Metal->CompressPML(m_Metal->pml.back(), 0);
-			m_Metal->CompressPML(m_Metal->pml.back(), 1);
-		}
+		m_Metal->CompressPML(m_Metal->pml.back(), 0);
+		m_Metal->CompressPML(m_Metal->pml.back(), 1);
 	}
 	// When every reordered operator coefficient was replaced by a compact
 	// dictionary, no scalar restoration needs the setup scratch. Flux storage is
@@ -829,7 +773,6 @@ void Engine_Metal::InitUPML()
 	if (!m_Metal->pml.empty())
 	{
 		cout << "Metal: GPU UPML conditioning: " << m_Metal->pml.size() << " regions" << endl;
-		cout << "Metal: UPML layout: " << (m_Metal->indexedPML ? "indexed" : "scalar") << endl;
 		cout << "Metal: UPML duplicate bytes avoided: " << m_Metal->reusedPMLBytes << endl;
 		cout << "Metal: UPML reorder scratch bytes retained: " << m_Metal->reorderScratch.size()*sizeof(float) << endl;
 	}
@@ -1136,10 +1079,7 @@ void Engine_Metal::RunUPMLExtensions(bool voltage, bool pre)
 			[encoder setBuffer:pre ? region->self[f] : region->newFlux[f] offset:0 atIndex:2];
 			if (pre)
 				[encoder setBuffer:region->oldFlux[f] offset:0 atIndex:3];
-			if (m_Metal->indexedPML)
-				[encoder setBuffer:region->indices offset:0 atIndex:5];
-			else
-				[encoder setBytes:&region->params length:sizeof(PMLParams) atIndex:4];
+			[encoder setBuffer:region->indices offset:0 atIndex:5];
 			const PMLParams& p = region->params;
 			[encoder dispatchThreads:MTLSizeMake((NSUInteger)p.nx * p.ny * p.nz * 3, 1, 1)
 				threadsPerThreadgroup:MTLSizeMake(pipeline.threadExecutionWidth, 1, 1)];

@@ -80,14 +80,12 @@ def make_model(path, cells, timesteps, nonuniform=False, boundaries=None, freque
     fdtd.Write2XML(str(path))
 
 
-def run(binary, model, engine, output, fp64_reference=False, compress=None, pml=None,
+def run(binary, model, engine, output, fp64_reference=False, pml=None,
         wavefront=None):
     output.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     if fp64_reference:
         env['OPENEMS_METAL_FP64_REFERENCE'] = '1'
-    if compress is not None:
-        env['OPENEMS_METAL_COMPRESS'] = '1' if compress else '0'
     if pml is not None:
         env['OPENEMS_METAL_PML'] = '1' if pml else '0'
     if wavefront is not None:
@@ -156,49 +154,23 @@ def run_case(args, cells, timesteps, label):
                    stress_sources=args.stress_sources)
         sse_time, _ = run(args.openems, model, 'sse', root / 'sse')
         metal_time, metal_log = run(args.openems, model, 'metal', root / 'metal',
-                                    args.fp64_reference,
-                                    True if args.compare_dense else None)
+                                    args.fp64_reference)
         if args.compare_wavefront:
             _, legacy_log = run(args.openems, model, 'metal', root / 'legacy',
-                                  args.fp64_reference,
-                                  True if args.compare_dense else None,
-                                  wavefront=False)
+                                args.fp64_reference, wavefront=False)
             if 'Metal: in-place diamond E/H pipeline: enabled' not in metal_log:
                 raise AssertionError('Diamond Metal pipeline was not enabled')
             if 'Metal: in-place diamond E/H pipeline: disabled' not in legacy_log:
                 raise AssertionError('Legacy Metal comparison was not selected')
             for field in ('Et.h5', 'Ht.h5'):
                 diamond_arrays = h5_arrays(root / 'metal' / field)
-                undiamond_arrays = h5_arrays(root / 'legacy' / field)
-                if diamond_arrays.keys() != undiamond_arrays.keys():
+                legacy_arrays = h5_arrays(root / 'legacy' / field)
+                if diamond_arrays.keys() != legacy_arrays.keys():
                     raise AssertionError('Diamond/legacy datasets differ')
                 for name in diamond_arrays:
-                    a, b = diamond_arrays[name], undiamond_arrays[name]
+                    a, b = diamond_arrays[name], legacy_arrays[name]
                     if a.shape != b.shape or a.dtype != b.dtype or a.tobytes() != b.tobytes():
                         raise AssertionError('Diamond/legacy bits differ: ' + field + '/' + name)
-        if args.compare_dense:
-            if not any(message in metal_log for message in (
-                    'Metal: lossless coefficients:',
-                    'Metal: coefficient dictionary limit reached; using dense coefficients')):
-                raise AssertionError('Coefficient compression/fallback was not exercised')
-            _, dense_log = run(args.openems, model, 'metal', root / 'dense',
-                               args.fp64_reference, compress=False)
-            if 'Metal: lossless coefficients:' in dense_log:
-                raise AssertionError('Dense Metal run unexpectedly enabled compression')
-            for field in ('Et.h5', 'Ht.h5'):
-                dense = h5_arrays(root / 'dense' / field)
-                packed = h5_arrays(root / 'metal' / field)
-                if dense.keys() != packed.keys():
-                    raise AssertionError('Dense/compressed datasets differ')
-                for name in dense:
-                    a, b = dense[name], packed[name]
-                    if a.shape != b.shape or a.dtype != b.dtype or a.tobytes() != b.tobytes():
-                        raise AssertionError('Dense/compressed bits differ: ' + field + '/' + name)
-            if args.fp64_reference:
-                prefix = 'Metal FP64 update reference:'
-                if ([s for s in dense_log.splitlines() if s.startswith(prefix)] !=
-                        [s for s in metal_log.splitlines() if s.startswith(prefix)]):
-                    raise AssertionError('Dense/compressed FP64 diagnostics differ')
         e = compare(root / 'sse' / 'Et.h5', root / 'metal' / 'Et.h5',
                     args.rtol, args.atol)
         h = compare(root / 'sse' / 'Ht.h5', root / 'metal' / 'Ht.h5',
@@ -207,12 +179,6 @@ def run_case(args, cells, timesteps, label):
         print('{}: {} x {} x {}, {} timesteps'.format(label, *cells, timesteps))
         if args.compare_wavefront:
             print('  Diamond/legacy Metal: bit-identical complete E/H dumps')
-        if args.compare_dense:
-            print('  Dense/compressed Metal: bit-identical complete E/H dumps')
-            for line in metal_log.splitlines():
-                if line.startswith(('Metal: lossless coefficients:',
-                                    'Metal: coefficient dictionary limit')):
-                    print('  ' + line)
         print('  SSE/Metal: {:.3f} / {:.3f} s ({:.2f}x)'.format(
               sse_time, metal_time, sse_time / metal_time))
         print('  E max abs/rel, relative L2, RMS, failures: '
@@ -250,8 +216,6 @@ def main():
     parser.add_argument('--rtol', type=float, default=2e-4)
     parser.add_argument('--atol', type=float, default=1e-6)
     parser.add_argument('--keep', action='store_true')
-    parser.add_argument('--compare-dense', action='store_true',
-                        help='require bit-identical dumps from dense and compressed Metal')
     parser.add_argument('--compare-wavefront', '--compare-fused', dest='compare_wavefront',
                         action='store_true',
                         help='require bit-identical dumps from diamond and legacy Metal')

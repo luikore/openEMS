@@ -373,54 +373,6 @@ kernel void ade_apply(
 	field[f] = v;
 }
 
-// UPML arrays are scalar NIJK, while fields use the SSE z-lane layout.
-// Scalar stores touch only physical cells, never SIMD padding lanes.
-struct PMLParams
-{
-	uint sx, sy, sz;
-	uint nx, ny, nz;
-	uint grid_ny, grid_nzv;
-};
-
-kernel void upml_pre(
-	device float* field [[buffer(0)]],
-	device float* flux [[buffer(1)]],
-	const device float* self [[buffer(2)]],
-	const device float* oldFlux [[buffer(3)]],
-	constant PMLParams& p [[buffer(4)]],
-	uint gid [[thread_position_in_grid]])
-{
-	const uint cells = p.nx * p.ny * p.nz;
-	if (gid >= 3 * cells) return;
-	const uint n = gid / cells;
-	const uint z = gid % p.nz + p.sz;
-	const uint y = (gid / p.nz) % p.ny + p.sy;
-	const uint x = (gid % cells) / (p.ny * p.nz) + p.sx;
-	const uint f = (((x * p.grid_ny + y) * p.grid_nzv + z % p.grid_nzv) * 3 + n) * 4 + z / p.grid_nzv;
-	const float saved = self[gid] * field[f] - oldFlux[gid] * flux[gid];
-	field[f] = flux[gid];
-	flux[gid] = saved;
-}
-
-kernel void upml_post(
-	device float* field [[buffer(0)]],
-	device float* flux [[buffer(1)]],
-	const device float* newFlux [[buffer(2)]],
-	constant PMLParams& p [[buffer(4)]],
-	uint gid [[thread_position_in_grid]])
-{
-	const uint cells = p.nx * p.ny * p.nz;
-	if (gid >= 3 * cells) return;
-	const uint n = gid / cells;
-	const uint z = gid % p.nz + p.sz;
-	const uint y = (gid / p.nz) % p.ny + p.sy;
-	const uint x = (gid % cells) / (p.ny * p.nz) + p.sx;
-	const uint f = (((x * p.grid_ny + y) * p.grid_nzv + z % p.grid_nzv) * 3 + n) * 4 + z / p.grid_nzv;
-	const float saved = flux[gid];
-	flux[gid] = field[f];
-	field[f] = saved + newFlux[gid] * flux[gid];
-}
-
 // Auxiliary arrays are reordered once into increasing packed-field addresses.
 // Each lane performs only an indexed field access and contiguous auxiliary I/O;
 // no coordinate division or component-major passes through the field buffer.
