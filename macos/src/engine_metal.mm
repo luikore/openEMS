@@ -56,6 +56,15 @@ struct GridParams
 	uint32_t num_x;
 };
 
+// Host mirror of the shader PMLRegion record. Coefficients and flux are dense
+// in the slab's local [component][x][y][z] order.
+struct PMLRegionDesc
+{
+	uint32_t sx, sy, sz;
+	uint32_t nx, ny, nz;
+	uint32_t coeffBase, fluxBase;
+};
+
 struct ExcitationSource
 {
 	uint32_t fieldIndex;
@@ -86,7 +95,12 @@ struct DiamondStep
 };
 
 struct DiamondTile { DiamondStep steps[DIAMOND_DEPTH]; };
-struct DiamondParams { uint32_t nx, ny, nzv, timestep, depth; float dT_half; };
+struct DiamondParams
+{
+	uint32_t nx, ny, nzv, timestep, depth;
+	float dT_half;
+	uint32_t pmlRegionCount, pmlPad;
+};
 
 struct DiamondSource
 {
@@ -162,10 +176,11 @@ static DiamondAxis MakeDiamondAxis(uint32_t width, uint32_t blockWidth, uint32_t
 
 static_assert(sizeof(DiamondStep) == 64, "Metal DiamondStep ABI");
 static_assert(sizeof(DiamondTile) == 256, "Metal DiamondTile ABI");
-static_assert(sizeof(DiamondParams) == 24, "Metal DiamondParams ABI");
+static_assert(sizeof(DiamondParams) == 32, "Metal DiamondParams ABI");
 static_assert(sizeof(DiamondSource) == 24, "Metal DiamondSource ABI");
 static_assert(sizeof(RLCEntry) == 32, "Metal RLCEntry ABI");
 static_assert(sizeof(RLCState) == 16, "Metal RLCState ABI");
+static_assert(sizeof(PMLRegionDesc) == 32, "Metal PMLRegionDesc ABI");
 
 static std::runtime_error MetalError(const char* what, NSError* error)
 {
@@ -262,6 +277,18 @@ struct Engine_Metal::MetalState
 		std::vector<std::array<uint32_t, 2>> xy;
 	};
 	std::vector<RLCRegion> rlc;
+
+	// UPML slabs folded into the diamond wavefront. Coefficients and flux are
+	// dense local copies; the region records carry the grid bounds and offsets.
+	struct DiamondPML
+	{
+		id<MTLBuffer> coeff;
+		id<MTLBuffer> flux;
+		id<MTLBuffer> regions;
+		uint32_t count = 0;
+	};
+	DiamondPML diamondPml;
+	bool diamondHasUPML = false;
 
 	void CompressPML(PMLRegion& region, unsigned int field)
 	{
@@ -663,7 +690,6 @@ void Engine_Metal::Init()
 			m_Metal->pmlPostPipeline[compressed] = [m_Metal->device newComputePipelineStateWithFunction:function error:&error];
 			if (!m_Metal->pmlPostPipeline[compressed]) throw MetalError("Metal: UPML post pipeline failed", error);
 		}
-		InitUPML();
 		InitExcitations();
 
 		const char* reference = std::getenv("OPENEMS_METAL_FP64_REFERENCE");
@@ -683,6 +709,7 @@ void Engine_Metal::Init()
 		InitADE();
 		if (!m_Metal->ade.empty())
 			m_Metal->diamondRequested = false;
+		InitUPML();
 		InitRLC();
 		InitDiamondUpdate();
 		cout << "Metal: in-place diamond E/H pipeline: " << (m_Metal->diamondUpdate ? "enabled" : "disabled") << endl;
@@ -711,6 +738,11 @@ void Engine_Metal::InitUPML()
 		m_Metal->diamondRequested = false;
 		m_Metal->legacyRequested = true;
 		cout << "Metal: CPU UPML conditioning selected" << endl;
+		return;
+	}
+	if (m_Metal->diamondRequested)
+	{
+		InitUPMLDiamond();
 		return;
 	}
 
@@ -809,6 +841,54 @@ void Engine_Metal::InitUPML()
 		cout << "Metal: UPML duplicate bytes avoided: " << m_Metal->reusedPMLBytes << endl;
 		cout << "Metal: UPML reorder scratch bytes retained: " << m_Metal->reorderScratch.size()*sizeof(float) << endl;
 	}
+}
+
+void Engine_Metal::InitUPMLDiamond()
+{
+	// The diamond wavefront applies the flux recurrence inside the fused E/H
+	// kernel. Copy each slab's operator coefficients and CPU flux state into one
+	// dense local buffer; the operator arrays stay in their original order so
+	// Reset has nothing to restore.
+	std::vector<PMLRegionDesc> regions;
+	std::vector<float> coeff;
+	std::vector<float> flux;
+	for (Engine_Extension* extension : m_Eng_exts)
+	{
+		Engine_Ext_UPML* pml = dynamic_cast<Engine_Ext_UPML*>(extension);
+		if (!pml)
+			continue;
+		Operator_Ext_UPML* op = pml->m_Op_UPML;
+		// Opposing slabs can leave an empty interior for another face.
+		if (!op->m_numLines[0] || !op->m_numLines[1] || !op->m_numLines[2])
+			continue;
+		const size_t plane = 3 * (size_t)op->m_numLines[0] * op->m_numLines[1] * op->m_numLines[2];
+		PMLRegionDesc region;
+		region.sx = op->m_StartPos[0]; region.sy = op->m_StartPos[1]; region.sz = op->m_StartPos[2];
+		region.nx = op->m_numLines[0]; region.ny = op->m_numLines[1]; region.nz = op->m_numLines[2];
+		region.coeffBase = static_cast<uint32_t>(coeff.size());
+		region.fluxBase = static_cast<uint32_t>(flux.size());
+		const ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[6] = {
+			&op->vv, &op->vvfo, &op->vvfn, &op->ii, &op->iifo, &op->iifn};
+		for (const ArrayLib::ArrayNIJK<FDTD_FLOAT>* array : arrays)
+			coeff.insert(coeff.end(), array->data(), array->data() + plane);
+		flux.insert(flux.end(), pml->volt_flux.data(), pml->volt_flux.data() + plane);
+		flux.insert(flux.end(), pml->curr_flux.data(), pml->curr_flux.data() + plane);
+		regions.push_back(region);
+	}
+	if (regions.empty())
+		return;
+	m_Metal->diamondPml.coeff = [m_Metal->device newBufferWithBytes:coeff.data()
+		length:coeff.size() * sizeof(float) options:MTLResourceStorageModeShared];
+	m_Metal->diamondPml.flux = [m_Metal->device newBufferWithBytes:flux.data()
+		length:flux.size() * sizeof(float) options:MTLResourceStorageModeShared];
+	m_Metal->diamondPml.regions = [m_Metal->device newBufferWithBytes:regions.data()
+		length:regions.size() * sizeof(PMLRegionDesc) options:MTLResourceStorageModeShared];
+	if (!m_Metal->diamondPml.coeff || !m_Metal->diamondPml.flux || !m_Metal->diamondPml.regions)
+		throw std::runtime_error("Metal: failed to allocate diamond UPML buffers");
+	m_Metal->diamondPml.count = static_cast<uint32_t>(regions.size());
+	m_Metal->diamondHasUPML = true;
+	cout << "Metal: diamond UPML: " << regions.size() << " regions, "
+	     << coeff.size() * sizeof(float) << " coefficient bytes" << endl;
 }
 
 void Engine_Metal::InitExcitations()
@@ -917,9 +997,11 @@ void Engine_Metal::InitDiamondUpdate()
 	bool compressed = m_Metal->coeffIndex != nil;
 	bool hasSources = !sourceTemplates.empty();
 	bool hasRLC = m_Metal->diamondHasRLC && !m_Metal->rlc.empty();
+	bool hasPML = m_Metal->diamondHasUPML && m_Metal->diamondPml.count > 0;
 	[constants setConstantValue:&compressed type:MTLDataTypeBool atIndex:0];
 	[constants setConstantValue:&hasSources type:MTLDataTypeBool atIndex:2];
 	[constants setConstantValue:&hasRLC type:MTLDataTypeBool atIndex:3];
+	[constants setConstantValue:&hasPML type:MTLDataTypeBool atIndex:4];
 	id<MTLFunction> function = [m_Metal->library newFunctionWithName:@"update_diamond"
 		constantValues:constants error:&error];
 	if (!function)
@@ -1394,7 +1476,8 @@ void Engine_Metal::InitRLC()
 
 void Engine_Metal::UpdateDiamond(unsigned int depth)
 {
-	DiamondParams params = {numLines[0], numLines[1], numVectors, numTS, depth, m_Metal->rlcDtHalf};
+	DiamondParams params = {numLines[0], numLines[1], numVectors, numTS, depth, m_Metal->rlcDtHalf,
+		m_Metal->diamondPml.count, 0};
 	// The kernel maps whole packed-Z slot groups to threads, so the threadgroup
 	// must be an exact multiple of the slot count it can cover.
 	const NSUInteger maxThreads = std::min<NSUInteger>({
@@ -1431,6 +1514,12 @@ void Engine_Metal::UpdateDiamond(unsigned int depth)
 			[encoder setBuffer:m_Metal->rlc.front().entries offset:0 atIndex:12];
 			[encoder setBuffer:m_Metal->rlc.front().state offset:0 atIndex:13];
 			[encoder setBuffer:m_Metal->diamondRLCIndices[depth][phase] offset:0 atIndex:14];
+		}
+		if (m_Metal->diamondHasUPML)
+		{
+			[encoder setBuffer:m_Metal->diamondPml.regions offset:0 atIndex:15];
+			[encoder setBuffer:m_Metal->diamondPml.coeff offset:0 atIndex:16];
+			[encoder setBuffer:m_Metal->diamondPml.flux offset:0 atIndex:17];
 		}
 		[encoder dispatchThreadgroups:MTLSizeMake(count, 1, 1)
 			threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];

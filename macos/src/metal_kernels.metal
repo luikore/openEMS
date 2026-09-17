@@ -8,6 +8,7 @@ constant bool compressedCoefficients [[function_constant(0)]];
 constant bool compressedPML [[function_constant(1)]];
 constant bool diamondExcitations [[function_constant(2)]];
 constant bool lumpedRLC [[function_constant(3)]];
+constant bool diamondUPML [[function_constant(4)]];
 
 struct GridParams
 {
@@ -190,6 +191,8 @@ struct DiamondParams
 	uint timestep;
 	uint depth;
 	float dT_half;
+	uint pml_region_count;
+	uint pad0;
 };
 
 struct DiamondSource
@@ -225,6 +228,98 @@ struct RLCState
 	float Il;
 };
 
+// One UPML slab. Coefficients and flux live in the slab's dense local order
+// [component][x][y][z]; the diamond kernel applies them per packed lane because
+// the four lanes of a float4 span four z positions.
+struct PMLRegion
+{
+	uint sx, sy, sz;
+	uint nx, ny, nz;
+	uint coeffBase, fluxBase;
+};
+
+inline void pml_pre_component(device float4* field, uint fi,
+	const device float* coeff, device float* flux,
+	uint selfBase, uint oldBase, uint fluxBase,
+	uint slot, uint nzv, uint sz, uint nz)
+{
+	const float4 e = field[fi];
+	float4 self = 1.0f, old = 0.0f, fv = e;
+	for (uint l = 0; l < 4; ++l)
+	{
+		const uint z = slot + l * nzv;
+		if (z >= sz && z < sz + nz)
+		{
+			const uint zl = z - sz;
+			self[l] = coeff[selfBase + zl];
+			old[l] = coeff[oldBase + zl];
+			fv[l] = flux[fluxBase + zl];
+		}
+	}
+	const float4 saved = self * e - old * fv;
+	field[fi] = fv;
+	for (uint l = 0; l < 4; ++l)
+	{
+		const uint z = slot + l * nzv;
+		if (z >= sz && z < sz + nz)
+			flux[fluxBase + (z - sz)] = saved[l];
+	}
+}
+
+inline void pml_post_component(device float4* field, uint fi,
+	const device float* coeff, device float* flux,
+	uint newBase, uint fluxBase,
+	uint slot, uint nzv, uint sz, uint nz)
+{
+	const float4 e = field[fi];
+	float4 saved = e, nf = 0.0f;
+	for (uint l = 0; l < 4; ++l)
+	{
+		const uint z = slot + l * nzv;
+		if (z >= sz && z < sz + nz)
+		{
+			const uint zl = z - sz;
+			saved[l] = flux[fluxBase + zl];
+			nf[l] = coeff[newBase + zl];
+		}
+	}
+	for (uint l = 0; l < 4; ++l)
+	{
+		const uint z = slot + l * nzv;
+		if (z >= sz && z < sz + nz)
+			flux[fluxBase + (z - sz)] = e[l];
+	}
+	field[fi] = saved + nf * e;
+}
+
+// Apply one region to all three components of a packed field. Regions are
+// disjoint in (x, y), so a cell is touched by at most one slab; callers still
+// walk the full list so a nonstandard layout stays correct.
+inline void pml_region(device float4* field, uint base, uint x, uint y,
+	uint slot, uint nzv, const device PMLRegion* regions, uint regionIndex,
+	const device float* coeff, device float* flux, bool voltage, bool post)
+{
+	const PMLRegion R = regions[regionIndex];
+	if (x < R.sx || x >= R.sx + R.nx || y < R.sy || y >= R.sy + R.ny)
+		return;
+	const uint cells = R.nx * R.ny * R.nz;
+	const uint plane = 3 * cells;
+	const uint cellOff = ((x - R.sx) * R.ny + (y - R.sy)) * R.nz;
+	const uint cbase = R.coeffBase + cellOff + (voltage ? 0 : 3) * plane;
+	const uint fbase = R.fluxBase + cellOff + (voltage ? 0 : plane);
+	for (uint n = 0; n < 3; ++n)
+	{
+		if (post)
+			pml_post_component(field, base + n, coeff, flux,
+				cbase + 2 * plane + n * cells, fbase + n * cells,
+				slot, nzv, R.sz, R.nz);
+		else
+			pml_pre_component(field, base + n, coeff, flux,
+				cbase + n * cells, cbase + plane + n * cells, fbase + n * cells,
+				slot, nzv, R.sz, R.nz);
+	}
+}
+
 kernel void update_diamond(
 	device float4* volt [[buffer(0)]],
 	device float4* curr [[buffer(1)]],
@@ -241,6 +336,9 @@ kernel void update_diamond(
 	const device RLCEntry* rlc [[buffer(12), function_constant(lumpedRLC)]],
 	device RLCState* rlc_state [[buffer(13), function_constant(lumpedRLC)]],
 	const device uint* rlc_indices [[buffer(14), function_constant(lumpedRLC)]],
+	const device PMLRegion* pml_regions [[buffer(15), function_constant(diamondUPML)]],
+	const device float* pml_coeff [[buffer(16), function_constant(diamondUPML)]],
+	device float* pml_flux [[buffer(17), function_constant(diamondUPML)]],
 	uint tileId [[threadgroup_position_in_grid]],
 	uint tid [[thread_index_in_threadgroup]],
 	uint threads [[threads_per_threadgroup]])
@@ -299,6 +397,10 @@ kernel void update_diamond(
 						hy_z = curr[base - 2];
 						hx_z = curr[base - 3];
 					}
+					if (diamondUPML)
+						for (int r = (int)p.pml_region_count - 1; r >= 0; --r)
+							pml_region(volt, base, x, y, slot, nzv, pml_regions,
+								(uint)r, pml_coeff, pml_flux, true, false);
 					const float4 ex = volt[base];
 					const float4 ey = volt[base + 1];
 					const float4 ez = volt[base + 2];
@@ -306,6 +408,10 @@ kernel void update_diamond(
 					volt[base] = ex * vv[cc] + vi[cc] * (cz - hz_y - cy + hy_z);
 					volt[base + 1] = ey * vv[cc + 1] + vi[cc + 1] * (cx - hx_z - cz + hz_x);
 					volt[base + 2] = ez * vv[cc + 2] + vi[cc + 2] * (cy - hy_x - cx + hx_y);
+					if (diamondUPML)
+						for (uint r = 0; r < p.pml_region_count; ++r)
+							pml_region(volt, base, x, y, slot, nzv, pml_regions,
+								r, pml_coeff, pml_flux, true, true);
 					y += dy;
 					x += dx;
 					if (y >= vy0 + vny)
@@ -396,6 +502,10 @@ kernel void update_diamond(
 							ey_z = float4(ey_start.y, ey_start.z, ey_start.w, 0.0f);
 							ex_z = float4(ex_start.y, ex_start.z, ex_start.w, 0.0f);
 						}
+						if (diamondUPML)
+							for (int r = (int)p.pml_region_count - 1; r >= 0; --r)
+								pml_region(curr, base, x, y, slot, nzv, pml_regions,
+									(uint)r, pml_coeff, pml_flux, false, false);
 						const float4 hx = curr[base];
 						const float4 hy = curr[base + 1];
 						const float4 hz = curr[base + 2];
@@ -403,6 +513,10 @@ kernel void update_diamond(
 						curr[base] = hx * ii[cc] + iv[cc] * (ez - ez_y - ey + ey_z);
 						curr[base + 1] = hy * ii[cc + 1] + iv[cc + 1] * (ex - ex_z - ez + ez_x);
 						curr[base + 2] = hz * ii[cc + 2] + iv[cc + 2] * (ey - ey_x - ex + ex_y);
+						if (diamondUPML)
+							for (uint r = 0; r < p.pml_region_count; ++r)
+								pml_region(curr, base, x, y, slot, nzv, pml_regions,
+									r, pml_coeff, pml_flux, false, true);
 						y += dy;
 						x += dx;
 						if (y >= cy0 + cny)
