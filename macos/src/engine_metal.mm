@@ -1264,9 +1264,14 @@ void Engine_Metal::InitADE()
 void Engine_Metal::UpdateDiamond(unsigned int depth)
 {
 	DiamondParams params = {numLines[0], numLines[1], numVectors, numTS, depth};
-	const NSUInteger threads = std::min<NSUInteger>({256,
+	// The kernel maps whole packed-Z slot groups to threads, so the threadgroup
+	// must be an exact multiple of the slot count it can cover.
+	const NSUInteger maxThreads = std::min<NSUInteger>({
 		m_Metal->diamondPipeline.maxTotalThreadsPerThreadgroup,
 		m_Metal->device.maxThreadsPerThreadgroup.width});
+	const NSUInteger slots = std::min<NSUInteger>(numVectors, maxThreads);
+	const NSUInteger groups = std::max<NSUInteger>(1, 256 / slots);
+	const NSUInteger threads = slots * groups;
 	for (unsigned int phase = 0; phase < 4; ++phase)
 	{
 		const uint32_t count = m_Metal->diamondTileCount[depth][phase];

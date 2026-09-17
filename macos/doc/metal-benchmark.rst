@@ -97,56 +97,60 @@ is the explicit ``OPENEMS_METAL_FUSED_PIPELINE=0`` comparison.
      - Diamond advantage (step / wall)
    * - PEC, 3.0M cells, 600 steps
      - **metal diamond** (depth 4)
-     - 1.365
-     - 0.355
-     - 5090
-     - 463
+     - 1.388
+     - 0.322
+     - 5618
+     - 462
      - —
    * - PEC, 3.0M cells, 600 steps
      - metal legacy
-     - 1.817
-     - 0.816
-     - 2216
+     - 2.008
+     - 0.933
+     - 1939
      - 460
-     - **2.30x / 1.33x**
+     - **2.90x / 1.45x**
    * - PEC, 3.0M cells, 600 steps
-     - **mt-10** (fastest CPU)
-     - 1.837
-     - 0.724
-     - 2497
+     - **mt-8** (fastest CPU)
+     - 1.935
+     - 0.748
+     - 2419
      - 320
-     - **2.04x / 1.35x**
+     - **2.32x / 1.39x**
    * - PEC, 17.0M cells, 1000 steps
      - **metal diamond** (depth 4)
-     - 9.838
-     - 4.400
-     - 3858
+     - 9.599
+     - 4.210
+     - 4032
      - 2406
      - —
    * - PEC, 17.0M cells, 1000 steps
      - metal legacy
-     - 10.859
-     - 5.490
-     - 3092
+     - 10.969
+     - 5.540
+     - 3064
      - 2398
-     - **1.25x / 1.10x**
+     - **1.32x / 1.14x**
    * - PEC, 17.0M cells, 1000 steps
      - **mt-8** (fastest CPU)
-     - 15.938
-     - 7.880
-     - 2154
+     - 15.965
+     - 7.930
+     - 2141
      - 1656
-     - **1.79x / 1.62x**
+     - **1.88x / 1.66x**
 
 Analysis
 --------
 
 * The in-place diamond kernel improves stepping over the old two-dispatch Metal
-  update by **2.30x at 3.0M cells** and **1.25x at 17.0M cells**. Four timesteps
+  update by **2.90x at 3.0M cells** and **1.32x at 17.0M cells**. Four timesteps
   share each tile's cache working set, and four mountain/valley dispatches
   replace eight whole-grid dispatches per temporal block.
+* The cell loop carries no runtime integer division: threads cover whole
+  packed-Z slot groups and walk the tile's (x, y) pairs by a stride whose delta
+  is computed once. Measured against the previous diamond kernel this is
+  **1.08-1.16x** further stepping speedup (larger on ALU-bound small grids).
 * Against the previously measured fastest CPU configuration, diamond Metal is
-  **1.79-2.04x faster in stepping** and **1.35-1.62x faster wall-to-wall**.
+  **1.88-2.32x faster in stepping** and **1.39-1.66x faster wall-to-wall**.
 * A two-cell shortest diamond span provides enough independent threadgroups on
   the larger grid. Wider tiles reduced occupancy and lost the large-grid gain.
 * The kernel remains in place and allocates no second E/H field pair. Schedule
@@ -174,10 +178,10 @@ engines build, plus the Metal buffers in the Metal case.
      - CPU [MB]
      - Diamond / legacy delta
    * - PEC, 3.0M cells, 600 steps
-     - 463
+     - 462
      - 460
      - 320
-     - +3
+     - +2
    * - PEC, 17.0M cells, 1000 steps
      - 2406
      - 2398

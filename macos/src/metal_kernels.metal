@@ -212,53 +212,76 @@ kernel void update_diamond(
 	uint tid [[thread_index_in_threadgroup]],
 	uint threads [[threads_per_threadgroup]])
 {
-	const DiamondTile tile = tiles[tileId];
-	const uint y_stride = p.nzv * 3;
+	const uint nzv = p.nzv;
+	const uint y_stride = nzv * 3;
 	const uint x_stride = p.ny * y_stride;
+	// Threads cover whole packed-Z slot groups. Each thread then walks the tile's
+	// (x, y) pairs by a fixed stride; the per-step delta is precomputed once, so
+	// no runtime integer division appears in the cell loop.
+	const uint slots = min(nzv, threads);
+	const uint slot0 = tid % slots;
+	const uint pair0 = tid / slots;
+	const uint groups = threads / slots;
 	for (uint timestep = 0; timestep < p.depth; ++timestep)
 	{
-		const DiamondStep step = tile.steps[timestep];
-		const uint voltage_nx = step.voltage_range.y - step.voltage_range.x + 1;
-		const uint voltage_ny = step.voltage_range.w - step.voltage_range.z + 1;
-		const uint voltage_cells = voltage_nx * voltage_ny * p.nzv;
-		for (uint cell = tid; cell < voltage_cells; cell += threads)
+		const DiamondStep step = tiles[tileId].steps[timestep];
+		if (step.voltage_range.x >= 0)
 		{
-			const uint slot = cell % p.nzv;
-			const uint q = cell / p.nzv;
-			const uint y = step.voltage_range.z + q % voltage_ny;
-			const uint x = step.voltage_range.x + q / voltage_ny;
-			const uint base = x * x_stride + y * y_stride + slot * 3;
-			const uint base_xm = x == 0 ? base : base - x_stride;
-			const uint base_ym = y == 0 ? base : base - y_stride;
-			const float4 cx = curr[base];
-			const float4 cy = curr[base + 1];
-			const float4 cz = curr[base + 2];
-			const float4 hz_y = curr[base_ym + 2];
-			const float4 hx_y = curr[base_ym];
-			const float4 hz_x = curr[base_xm + 2];
-			const float4 hy_x = curr[base_xm + 1];
-			float4 hy_z;
-			float4 hx_z;
-			if (slot == 0)
+			const uint vx0 = step.voltage_range.x, vy0 = step.voltage_range.z;
+			const uint vnx = step.voltage_range.y - vx0 + 1;
+			const uint vny = step.voltage_range.w - vy0 + 1;
+			const uint pairs = vnx * vny;
+			const uint dx = groups / vny, dy = groups % vny;
+			for (uint zbase = 0; zbase < nzv; zbase += slots)
 			{
-				const uint end = base + (p.nzv - 1) * 3;
-				const float4 hy_end = curr[end + 1];
-				const float4 hx_end = curr[end];
-				hy_z = float4(0.0f, hy_end.x, hy_end.y, hy_end.z);
-				hx_z = float4(0.0f, hx_end.x, hx_end.y, hx_end.z);
+				const uint slot = zbase + slot0;
+				if (slot >= nzv)
+					break;
+				uint x = vx0 + pair0 / vny;
+				uint y = vy0 + pair0 % vny;
+				for (uint pair = pair0; pair < pairs; pair += groups)
+				{
+					const uint base = x * x_stride + y * y_stride + slot * 3;
+					const uint base_xm = x == 0 ? base : base - x_stride;
+					const uint base_ym = y == 0 ? base : base - y_stride;
+					const float4 cx = curr[base];
+					const float4 cy = curr[base + 1];
+					const float4 cz = curr[base + 2];
+					const float4 hz_y = curr[base_ym + 2];
+					const float4 hx_y = curr[base_ym];
+					const float4 hz_x = curr[base_xm + 2];
+					const float4 hy_x = curr[base_xm + 1];
+					float4 hy_z;
+					float4 hx_z;
+					if (slot == 0)
+					{
+						const uint end = base + (nzv - 1) * 3;
+						const float4 hy_end = curr[end + 1];
+						const float4 hx_end = curr[end];
+						hy_z = float4(0.0f, hy_end.x, hy_end.y, hy_end.z);
+						hx_z = float4(0.0f, hx_end.x, hx_end.y, hx_end.z);
+					}
+					else
+					{
+						hy_z = curr[base - 2];
+						hx_z = curr[base - 3];
+					}
+					const float4 ex = volt[base];
+					const float4 ey = volt[base + 1];
+					const float4 ez = volt[base + 2];
+					const uint cc = compressedCoefficients ? coeffIndex[base / 3] * 3 : base;
+					volt[base] = ex * vv[cc] + vi[cc] * (cz - hz_y - cy + hy_z);
+					volt[base + 1] = ey * vv[cc + 1] + vi[cc + 1] * (cx - hx_z - cz + hz_x);
+					volt[base + 2] = ez * vv[cc + 2] + vi[cc + 2] * (cy - hy_x - cx + hx_y);
+					y += dy;
+					x += dx;
+					if (y >= vy0 + vny)
+					{
+						y -= vny;
+						++x;
+					}
+				}
 			}
-			else
-			{
-				hy_z = curr[base - 2];
-				hx_z = curr[base - 3];
-			}
-			const float4 ex = volt[base];
-			const float4 ey = volt[base + 1];
-			const float4 ez = volt[base + 2];
-			const uint cc = compressedCoefficients ? coeffIndex[base / 3] * 3 : base;
-			volt[base] = ex * vv[cc] + vi[cc] * (cz - hz_y - cy + hy_z);
-			volt[base + 1] = ey * vv[cc + 1] + vi[cc + 1] * (cx - hx_z - cz + hz_x);
-			volt[base + 2] = ez * vv[cc + 2] + vi[cc + 2] * (cy - hy_x - cx + hx_y);
 		}
 		threadgroup_barrier(mem_flags::mem_device);
 		if (diamondExcitations && tid == 0)
@@ -274,48 +297,66 @@ kernel void update_diamond(
 					source.amplitude * signal[source.signal_offset + sample];
 			}
 		threadgroup_barrier(mem_flags::mem_device);
-
-		const int stop_x = min(step.current_range.y, (int)p.nx - 2);
-		const int stop_y = min(step.current_range.w, (int)p.ny - 2);
-		const uint current_nx = stop_x >= step.current_range.x ? stop_x - step.current_range.x + 1 : 0;
-		const uint current_ny = stop_y >= step.current_range.z ? stop_y - step.current_range.z + 1 : 0;
-		const uint current_cells = current_nx * current_ny * p.nzv;
-		for (uint cell = tid; cell < current_cells; cell += threads)
+		if (step.current_range.x >= 0)
 		{
-			const uint slot = cell % p.nzv;
-			const uint q = cell / p.nzv;
-			const uint y = step.current_range.z + q % current_ny;
-			const uint x = step.current_range.x + q / current_ny;
-			const uint base = x * x_stride + y * y_stride + slot * 3;
-			const float4 ex = volt[base];
-			const float4 ey = volt[base + 1];
-			const float4 ez = volt[base + 2];
-			const float4 ez_y = volt[base + y_stride + 2];
-			const float4 ex_y = volt[base + y_stride];
-			const float4 ez_x = volt[base + x_stride + 2];
-			const float4 ey_x = volt[base + x_stride + 1];
-			float4 ey_z;
-			float4 ex_z;
-			if (slot + 1 < p.nzv)
+			const int stop_x = min(step.current_range.y, (int)p.nx - 2);
+			const int stop_y = min(step.current_range.w, (int)p.ny - 2);
+			if (stop_x >= step.current_range.x && stop_y >= step.current_range.z)
 			{
-				ey_z = volt[base + 4];
-				ex_z = volt[base + 3];
+				const uint cx0 = step.current_range.x, cy0 = step.current_range.z;
+				const uint cnx = stop_x - cx0 + 1;
+				const uint cny = stop_y - cy0 + 1;
+				const uint pairs = cnx * cny;
+				const uint dx = groups / cny, dy = groups % cny;
+				for (uint zbase = 0; zbase < nzv; zbase += slots)
+				{
+					const uint slot = zbase + slot0;
+					if (slot >= nzv)
+						break;
+					uint x = cx0 + pair0 / cny;
+					uint y = cy0 + pair0 % cny;
+					for (uint pair = pair0; pair < pairs; pair += groups)
+					{
+						const uint base = x * x_stride + y * y_stride + slot * 3;
+						const float4 ex = volt[base];
+						const float4 ey = volt[base + 1];
+						const float4 ez = volt[base + 2];
+						const float4 ez_y = volt[base + y_stride + 2];
+						const float4 ex_y = volt[base + y_stride];
+						const float4 ez_x = volt[base + x_stride + 2];
+						const float4 ey_x = volt[base + x_stride + 1];
+						float4 ey_z;
+						float4 ex_z;
+						if (slot + 1 < nzv)
+						{
+							ey_z = volt[base + 4];
+							ex_z = volt[base + 3];
+						}
+						else
+						{
+							const uint start = base - slot * 3;
+							const float4 ey_start = volt[start + 1];
+							const float4 ex_start = volt[start];
+							ey_z = float4(ey_start.y, ey_start.z, ey_start.w, 0.0f);
+							ex_z = float4(ex_start.y, ex_start.z, ex_start.w, 0.0f);
+						}
+						const float4 hx = curr[base];
+						const float4 hy = curr[base + 1];
+						const float4 hz = curr[base + 2];
+						const uint cc = compressedCoefficients ? coeffIndex[base / 3] * 3 : base;
+						curr[base] = hx * ii[cc] + iv[cc] * (ez - ez_y - ey + ey_z);
+						curr[base + 1] = hy * ii[cc + 1] + iv[cc + 1] * (ex - ex_z - ez + ez_x);
+						curr[base + 2] = hz * ii[cc + 2] + iv[cc + 2] * (ey - ey_x - ex + ex_y);
+						y += dy;
+						x += dx;
+						if (y >= cy0 + cny)
+						{
+							y -= cny;
+							++x;
+						}
+					}
+				}
 			}
-			else
-			{
-				const uint start = base - slot * 3;
-				const float4 ey_start = volt[start + 1];
-				const float4 ex_start = volt[start];
-				ey_z = float4(ey_start.y, ey_start.z, ey_start.w, 0.0f);
-				ex_z = float4(ex_start.y, ex_start.z, ex_start.w, 0.0f);
-			}
-			const float4 hx = curr[base];
-			const float4 hy = curr[base + 1];
-			const float4 hz = curr[base + 2];
-			const uint cc = compressedCoefficients ? coeffIndex[base / 3] * 3 : base;
-			curr[base] = hx * ii[cc] + iv[cc] * (ez - ez_y - ey + ey_z);
-			curr[base + 1] = hy * ii[cc + 1] + iv[cc + 1] * (ex - ex_z - ez + ez_x);
-			curr[base + 2] = hz * ii[cc + 2] + iv[cc + 2] * (ey - ey_x - ex + ex_y);
 		}
 		threadgroup_barrier(mem_flags::mem_device);
 		if (diamondExcitations && tid == 0)
