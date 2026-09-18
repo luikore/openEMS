@@ -289,6 +289,16 @@ struct Engine_Metal::MetalState
 	};
 	DiamondPML diamondPml;
 	bool diamondHasUPML = false;
+	// Operator coefficient arrays copied into the shared diamond buffers and
+	// released for the run. RestorePML rebuilds them on teardown so another
+	// engine can still reuse the operator.
+	struct ReleasedUPML
+	{
+		ArrayLib::ArrayNIJK<FDTD_FLOAT>* array;
+		std::array<uint32_t, 3> extent;
+		uint32_t floatOffset, count;
+	};
+	std::vector<ReleasedUPML> diamondReleasedUPML;
 
 	void CompressPML(PMLRegion& region, unsigned int field)
 	{
@@ -380,6 +390,19 @@ struct Engine_Metal::MetalState
 
 	void RestorePML()
 	{
+		// The diamond path copied the operator's dense UPML arrays into the shared
+		// coefficient buffer and released the originals for the run. Rebuild them
+		// exactly (shared storage, so the host reads the GPU buffer directly).
+		if (diamondPml.coeff)
+			for (const ReleasedUPML& released : diamondReleasedUPML)
+			{
+				released.array->Init("restored_upml_diamond", released.extent);
+				std::memcpy(released.array->data(),
+					static_cast<const float*>(diamondPml.coeff.contents) + released.floatOffset,
+					released.count * sizeof(float));
+			}
+		diamondReleasedUPML.clear();
+
 		for (const auto& saved : reordered)
 		{
 			const PMLParams& p = saved.params;
@@ -847,11 +870,17 @@ void Engine_Metal::InitUPMLDiamond()
 {
 	// The diamond wavefront applies the flux recurrence inside the fused E/H
 	// kernel. Copy each slab's operator coefficients and CPU flux state into one
-	// dense local buffer; the operator arrays stay in their original order so
-	// Reset has nothing to restore.
-	std::vector<PMLRegionDesc> regions;
-	std::vector<float> coeff;
-	std::vector<float> flux;
+	// dense local buffer, then release the CPU copies for the rest of the run:
+	// the CPU extension hooks never run in diamond mode.
+	struct Slab
+	{
+		Operator_Ext_UPML* op;
+		Engine_Ext_UPML* ext;
+		size_t plane;
+		PMLRegionDesc desc;
+	};
+	std::vector<Slab> slabs;
+	size_t coeffFloats = 0, fluxFloats = 0;
 	for (Engine_Extension* extension : m_Eng_exts)
 	{
 		Engine_Ext_UPML* pml = dynamic_cast<Engine_Ext_UPML*>(extension);
@@ -861,34 +890,60 @@ void Engine_Metal::InitUPMLDiamond()
 		// Opposing slabs can leave an empty interior for another face.
 		if (!op->m_numLines[0] || !op->m_numLines[1] || !op->m_numLines[2])
 			continue;
-		const size_t plane = 3 * (size_t)op->m_numLines[0] * op->m_numLines[1] * op->m_numLines[2];
-		PMLRegionDesc region;
-		region.sx = op->m_StartPos[0]; region.sy = op->m_StartPos[1]; region.sz = op->m_StartPos[2];
-		region.nx = op->m_numLines[0]; region.ny = op->m_numLines[1]; region.nz = op->m_numLines[2];
-		region.coeffBase = static_cast<uint32_t>(coeff.size());
-		region.fluxBase = static_cast<uint32_t>(flux.size());
-		const ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[6] = {
-			&op->vv, &op->vvfo, &op->vvfn, &op->ii, &op->iifo, &op->iifn};
-		for (const ArrayLib::ArrayNIJK<FDTD_FLOAT>* array : arrays)
-			coeff.insert(coeff.end(), array->data(), array->data() + plane);
-		flux.insert(flux.end(), pml->volt_flux.data(), pml->volt_flux.data() + plane);
-		flux.insert(flux.end(), pml->curr_flux.data(), pml->curr_flux.data() + plane);
-		regions.push_back(region);
+		Slab slab;
+		slab.op = op;
+		slab.ext = pml;
+		slab.plane = 3 * (size_t)op->m_numLines[0] * op->m_numLines[1] * op->m_numLines[2];
+		slab.desc.sx = op->m_StartPos[0]; slab.desc.sy = op->m_StartPos[1]; slab.desc.sz = op->m_StartPos[2];
+		slab.desc.nx = op->m_numLines[0]; slab.desc.ny = op->m_numLines[1]; slab.desc.nz = op->m_numLines[2];
+		slab.desc.coeffBase = static_cast<uint32_t>(coeffFloats);
+		slab.desc.fluxBase = static_cast<uint32_t>(fluxFloats);
+		coeffFloats += 6 * slab.plane;
+		fluxFloats += 2 * slab.plane;
+		slabs.push_back(slab);
 	}
-	if (regions.empty())
+	if (slabs.empty())
 		return;
-	m_Metal->diamondPml.coeff = [m_Metal->device newBufferWithBytes:coeff.data()
-		length:coeff.size() * sizeof(float) options:MTLResourceStorageModeShared];
-	m_Metal->diamondPml.flux = [m_Metal->device newBufferWithBytes:flux.data()
-		length:flux.size() * sizeof(float) options:MTLResourceStorageModeShared];
+	std::vector<PMLRegionDesc> regions;
+	regions.reserve(slabs.size());
+	for (const Slab& slab : slabs)
+		regions.push_back(slab.desc);
+	m_Metal->diamondPml.coeff = [m_Metal->device newBufferWithLength:coeffFloats * sizeof(float)
+		options:MTLResourceStorageModeShared];
+	m_Metal->diamondPml.flux = [m_Metal->device newBufferWithLength:fluxFloats * sizeof(float)
+		options:MTLResourceStorageModeShared];
 	m_Metal->diamondPml.regions = [m_Metal->device newBufferWithBytes:regions.data()
 		length:regions.size() * sizeof(PMLRegionDesc) options:MTLResourceStorageModeShared];
 	if (!m_Metal->diamondPml.coeff || !m_Metal->diamondPml.flux || !m_Metal->diamondPml.regions)
 		throw std::runtime_error("Metal: failed to allocate diamond UPML buffers");
-	m_Metal->diamondPml.count = static_cast<uint32_t>(regions.size());
+	// The coefficient buffer is published before any array is released, so a
+	// failure part-way through is undone by RestorePML on teardown.
+	float* coeff = static_cast<float*>(m_Metal->diamondPml.coeff.contents);
+	float* flux = static_cast<float*>(m_Metal->diamondPml.flux.contents);
+	for (const Slab& slab : slabs)
+	{
+		ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[6] = {
+			&slab.op->vv, &slab.op->vvfo, &slab.op->vvfn,
+			&slab.op->ii, &slab.op->iifo, &slab.op->iifn};
+		uint32_t offset = slab.desc.coeffBase;
+		for (ArrayLib::ArrayNIJK<FDTD_FLOAT>* array : arrays)
+		{
+			std::memcpy(coeff + offset, array->data(), slab.plane * sizeof(float));
+			m_Metal->diamondReleasedUPML.push_back({array,
+				{slab.op->m_numLines[0], slab.op->m_numLines[1], slab.op->m_numLines[2]},
+				offset, static_cast<uint32_t>(slab.plane)});
+			array->Reset();
+			offset += static_cast<uint32_t>(slab.plane);
+		}
+		std::memcpy(flux + slab.desc.fluxBase, slab.ext->volt_flux.data(), slab.plane * sizeof(float));
+		std::memcpy(flux + slab.desc.fluxBase + slab.plane, slab.ext->curr_flux.data(), slab.plane * sizeof(float));
+		slab.ext->volt_flux.Reset();
+		slab.ext->curr_flux.Reset();
+	}
+	m_Metal->diamondPml.count = static_cast<uint32_t>(slabs.size());
 	m_Metal->diamondHasUPML = true;
-	cout << "Metal: diamond UPML: " << regions.size() << " regions, "
-	     << coeff.size() * sizeof(float) << " coefficient bytes" << endl;
+	cout << "Metal: diamond UPML: " << slabs.size() << " regions, "
+	     << coeffFloats * sizeof(float) << " coefficient bytes" << endl;
 }
 
 void Engine_Metal::InitExcitations()

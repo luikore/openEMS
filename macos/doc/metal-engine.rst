@@ -98,10 +98,11 @@ Yee E and H updates, component by component. A packed ``float4`` spans four z
 positions, so each of its lanes is filtered by the slab's z range; lanes outside
 the slab keep the identity and are left untouched. Regions never overlap in
 ``(x, y)``, so a cell belongs to at most one slab. Coefficients and flux are
-ordinary shared buffers, and the operator arrays stay in their original order,
-so teardown has nothing to restore. Unlike the legacy path, the diamond copy is
-dense and not dictionary-compressed; it is a second copy alongside the
-operator's own coefficient arrays.
+ordinary shared buffers. Once the coefficients and flux are uploaded, the
+operator's dense arrays and the extension's CPU flux are released for the run,
+because the CPU UPML hooks never execute in diamond mode; the operator arrays
+are rebuilt from the shared buffer on teardown. The diamond storage is dense
+and not dictionary-compressed.
 
 The diamond path reproduces the legacy GPU conditioners bit for bit: the same
 local update, in the same CPU order (pre in reverse extension order, post
