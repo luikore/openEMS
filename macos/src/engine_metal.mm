@@ -62,7 +62,6 @@ struct PMLRegionDesc
 {
 	uint32_t sx, sy, sz;
 	uint32_t nx, ny, nz;
-	uint32_t coeffBase, fluxBase;
 };
 
 struct ExcitationSource
@@ -81,6 +80,8 @@ struct ExcitationParams
 };
 
 static const unsigned int DIAMOND_DEPTH = 4;
+// Must match the shader's UPMLArgs array sizes.
+static const uint32_t UPML_MAX_REGIONS = 6;
 
 struct DiamondStep
 {
@@ -180,7 +181,7 @@ static_assert(sizeof(DiamondParams) == 32, "Metal DiamondParams ABI");
 static_assert(sizeof(DiamondSource) == 24, "Metal DiamondSource ABI");
 static_assert(sizeof(RLCEntry) == 32, "Metal RLCEntry ABI");
 static_assert(sizeof(RLCState) == 16, "Metal RLCState ABI");
-static_assert(sizeof(PMLRegionDesc) == 32, "Metal PMLRegionDesc ABI");
+static_assert(sizeof(PMLRegionDesc) == 24, "Metal PMLRegionDesc ABI");
 
 static std::runtime_error MetalError(const char* what, NSError* error)
 {
@@ -278,27 +279,19 @@ struct Engine_Metal::MetalState
 	};
 	std::vector<RLCRegion> rlc;
 
-	// UPML slabs folded into the diamond wavefront. Coefficients and flux are
-	// dense local copies; the region records carry the grid bounds and offsets.
+	// UPML slabs folded into the diamond wavefront. The operator coefficient and
+	// extension flux arrays are wrapped in place (no copy) and referenced through
+	// one argument buffer; RegionDesc carries only the grid bounds.
 	struct DiamondPML
 	{
-		id<MTLBuffer> coeff;
-		id<MTLBuffer> flux;
 		id<MTLBuffer> regions;
+		id<MTLBuffer> args;
+		std::vector<id<MTLBuffer>> coeff;
+		std::vector<id<MTLBuffer>> flux;
 		uint32_t count = 0;
 	};
 	DiamondPML diamondPml;
 	bool diamondHasUPML = false;
-	// Operator coefficient arrays copied into the shared diamond buffers and
-	// released for the run. RestorePML rebuilds them on teardown so another
-	// engine can still reuse the operator.
-	struct ReleasedUPML
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>* array;
-		std::array<uint32_t, 3> extent;
-		uint32_t floatOffset, count;
-	};
-	std::vector<ReleasedUPML> diamondReleasedUPML;
 
 	void CompressPML(PMLRegion& region, unsigned int field)
 	{
@@ -390,19 +383,6 @@ struct Engine_Metal::MetalState
 
 	void RestorePML()
 	{
-		// The diamond path copied the operator's dense UPML arrays into the shared
-		// coefficient buffer and released the originals for the run. Rebuild them
-		// exactly (shared storage, so the host reads the GPU buffer directly).
-		if (diamondPml.coeff)
-			for (const ReleasedUPML& released : diamondReleasedUPML)
-			{
-				released.array->Init("restored_upml_diamond", released.extent);
-				std::memcpy(released.array->data(),
-					static_cast<const float*>(diamondPml.coeff.contents) + released.floatOffset,
-					released.count * sizeof(float));
-			}
-		diamondReleasedUPML.clear();
-
 		for (const auto& saved : reordered)
 		{
 			const PMLParams& p = saved.params;
@@ -868,19 +848,20 @@ void Engine_Metal::InitUPML()
 
 void Engine_Metal::InitUPMLDiamond()
 {
-	// The diamond wavefront applies the flux recurrence inside the fused E/H
-	// kernel. Copy each slab's operator coefficients and CPU flux state into one
-	// dense local buffer, then release the CPU copies for the rest of the run:
-	// the CPU extension hooks never run in diamond mode.
-	struct Slab
-	{
-		Operator_Ext_UPML* op;
-		Engine_Ext_UPML* ext;
-		size_t plane;
-		PMLRegionDesc desc;
+	// The diamond kernel reads each slab's coefficients and flux in the same
+	// dense local order the CPU hooks use, so wrap the existing arrays in place
+	// (no copy) and reference them through one argument buffer. The arrays stay
+	// owned by the operator and the engine extension.
+	const NSUInteger pageSize = (NSUInteger)getpagesize();
+	auto wrap = [&](const ArrayLib::ArrayNIJK<FDTD_FLOAT>& array) {
+		const NSUInteger bytes = (array.bytes() + pageSize - 1) / pageSize * pageSize;
+		id<MTLBuffer> buffer = [m_Metal->device newBufferWithBytesNoCopy:const_cast<FDTD_FLOAT*>(array.data())
+			length:bytes options:MTLResourceStorageModeShared deallocator:^(void*, NSUInteger) {}];
+		if (!buffer)
+			throw std::runtime_error("Metal: failed to wrap UPML buffer");
+		return buffer;
 	};
-	std::vector<Slab> slabs;
-	size_t coeffFloats = 0, fluxFloats = 0;
+	std::vector<PMLRegionDesc> regions;
 	for (Engine_Extension* extension : m_Eng_exts)
 	{
 		Engine_Ext_UPML* pml = dynamic_cast<Engine_Ext_UPML*>(extension);
@@ -890,60 +871,28 @@ void Engine_Metal::InitUPMLDiamond()
 		// Opposing slabs can leave an empty interior for another face.
 		if (!op->m_numLines[0] || !op->m_numLines[1] || !op->m_numLines[2])
 			continue;
-		Slab slab;
-		slab.op = op;
-		slab.ext = pml;
-		slab.plane = 3 * (size_t)op->m_numLines[0] * op->m_numLines[1] * op->m_numLines[2];
-		slab.desc.sx = op->m_StartPos[0]; slab.desc.sy = op->m_StartPos[1]; slab.desc.sz = op->m_StartPos[2];
-		slab.desc.nx = op->m_numLines[0]; slab.desc.ny = op->m_numLines[1]; slab.desc.nz = op->m_numLines[2];
-		slab.desc.coeffBase = static_cast<uint32_t>(coeffFloats);
-		slab.desc.fluxBase = static_cast<uint32_t>(fluxFloats);
-		coeffFloats += 6 * slab.plane;
-		fluxFloats += 2 * slab.plane;
-		slabs.push_back(slab);
+		if (regions.size() >= UPML_MAX_REGIONS)
+			throw std::runtime_error("Metal: more UPML regions than the diamond kernel supports");
+		PMLRegionDesc region;
+		region.sx = op->m_StartPos[0]; region.sy = op->m_StartPos[1]; region.sz = op->m_StartPos[2];
+		region.nx = op->m_numLines[0]; region.ny = op->m_numLines[1]; region.nz = op->m_numLines[2];
+		regions.push_back(region);
+		ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[6] = {
+			&op->vv, &op->vvfo, &op->vvfn, &op->ii, &op->iifo, &op->iifn};
+		for (ArrayLib::ArrayNIJK<FDTD_FLOAT>* array : arrays)
+			m_Metal->diamondPml.coeff.push_back(wrap(*array));
+		m_Metal->diamondPml.flux.push_back(wrap(pml->volt_flux));
+		m_Metal->diamondPml.flux.push_back(wrap(pml->curr_flux));
 	}
-	if (slabs.empty())
+	if (regions.empty())
 		return;
-	std::vector<PMLRegionDesc> regions;
-	regions.reserve(slabs.size());
-	for (const Slab& slab : slabs)
-		regions.push_back(slab.desc);
-	m_Metal->diamondPml.coeff = [m_Metal->device newBufferWithLength:coeffFloats * sizeof(float)
-		options:MTLResourceStorageModeShared];
-	m_Metal->diamondPml.flux = [m_Metal->device newBufferWithLength:fluxFloats * sizeof(float)
-		options:MTLResourceStorageModeShared];
 	m_Metal->diamondPml.regions = [m_Metal->device newBufferWithBytes:regions.data()
 		length:regions.size() * sizeof(PMLRegionDesc) options:MTLResourceStorageModeShared];
-	if (!m_Metal->diamondPml.coeff || !m_Metal->diamondPml.flux || !m_Metal->diamondPml.regions)
-		throw std::runtime_error("Metal: failed to allocate diamond UPML buffers");
-	// The coefficient buffer is published before any array is released, so a
-	// failure part-way through is undone by RestorePML on teardown.
-	float* coeff = static_cast<float*>(m_Metal->diamondPml.coeff.contents);
-	float* flux = static_cast<float*>(m_Metal->diamondPml.flux.contents);
-	for (const Slab& slab : slabs)
-	{
-		ArrayLib::ArrayNIJK<FDTD_FLOAT>* arrays[6] = {
-			&slab.op->vv, &slab.op->vvfo, &slab.op->vvfn,
-			&slab.op->ii, &slab.op->iifo, &slab.op->iifn};
-		uint32_t offset = slab.desc.coeffBase;
-		for (ArrayLib::ArrayNIJK<FDTD_FLOAT>* array : arrays)
-		{
-			std::memcpy(coeff + offset, array->data(), slab.plane * sizeof(float));
-			m_Metal->diamondReleasedUPML.push_back({array,
-				{slab.op->m_numLines[0], slab.op->m_numLines[1], slab.op->m_numLines[2]},
-				offset, static_cast<uint32_t>(slab.plane)});
-			array->Reset();
-			offset += static_cast<uint32_t>(slab.plane);
-		}
-		std::memcpy(flux + slab.desc.fluxBase, slab.ext->volt_flux.data(), slab.plane * sizeof(float));
-		std::memcpy(flux + slab.desc.fluxBase + slab.plane, slab.ext->curr_flux.data(), slab.plane * sizeof(float));
-		slab.ext->volt_flux.Reset();
-		slab.ext->curr_flux.Reset();
-	}
-	m_Metal->diamondPml.count = static_cast<uint32_t>(slabs.size());
+	if (!m_Metal->diamondPml.regions)
+		throw std::runtime_error("Metal: failed to allocate diamond UPML region buffer");
+	m_Metal->diamondPml.count = static_cast<uint32_t>(regions.size());
 	m_Metal->diamondHasUPML = true;
-	cout << "Metal: diamond UPML: " << slabs.size() << " regions, "
-	     << coeffFloats * sizeof(float) << " coefficient bytes" << endl;
+	cout << "Metal: diamond UPML: " << regions.size() << " regions, zero-copy" << endl;
 }
 
 void Engine_Metal::InitExcitations()
@@ -1064,6 +1013,28 @@ void Engine_Metal::InitDiamondUpdate()
 	m_Metal->diamondPipeline = [m_Metal->device newComputePipelineStateWithFunction:function error:&error];
 	if (!m_Metal->diamondPipeline)
 		throw MetalError("Metal: failed to create diamond pipeline", error);
+	if (hasPML)
+	{
+		// Encode the wrapped per-slab coefficient and flux buffers into the
+		// argument buffer the kernel reads as pml_args.
+		id<MTLArgumentEncoder> encoder = [function newArgumentEncoderWithBufferIndex:16];
+		if (!encoder)
+			throw std::runtime_error("Metal: failed to create UPML argument encoder");
+		m_Metal->diamondPml.args = [m_Metal->device newBufferWithLength:encoder.encodedLength
+			options:MTLResourceStorageModeShared];
+		if (!m_Metal->diamondPml.args)
+			throw std::runtime_error("Metal: failed to allocate UPML argument buffer");
+		[encoder setArgumentBuffer:m_Metal->diamondPml.args offset:0];
+		for (uint32_t r = 0; r < m_Metal->diamondPml.count; ++r)
+		{
+			for (uint32_t a = 0; a < 6; ++a)
+				[encoder setBuffer:m_Metal->diamondPml.coeff[r * 6 + a] offset:0
+					atIndex:r * 6 + a];
+			for (uint32_t b = 0; b < 2; ++b)
+				[encoder setBuffer:m_Metal->diamondPml.flux[r * 2 + b] offset:0
+					atIndex:UPML_MAX_REGIONS * 6 + r * 2 + b];
+		}
+	}
 	m_Metal->diamondHasSources = hasSources;
 	if (hasSources)
 	{
@@ -1573,8 +1544,11 @@ void Engine_Metal::UpdateDiamond(unsigned int depth)
 		if (m_Metal->diamondHasUPML)
 		{
 			[encoder setBuffer:m_Metal->diamondPml.regions offset:0 atIndex:15];
-			[encoder setBuffer:m_Metal->diamondPml.coeff offset:0 atIndex:16];
-			[encoder setBuffer:m_Metal->diamondPml.flux offset:0 atIndex:17];
+			[encoder setBuffer:m_Metal->diamondPml.args offset:0 atIndex:16];
+			for (id<MTLBuffer> buffer : m_Metal->diamondPml.coeff)
+				[encoder useResource:buffer usage:MTLResourceUsageRead];
+			for (id<MTLBuffer> buffer : m_Metal->diamondPml.flux)
+				[encoder useResource:buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
 		}
 		[encoder dispatchThreadgroups:MTLSizeMake(count, 1, 1)
 			threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];

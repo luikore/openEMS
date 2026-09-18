@@ -91,18 +91,16 @@ UPML
 ----
 
 The uniaxial PML runs inside the diamond wavefront. Each slab's six operator
-coefficient arrays and its CPU flux state are copied into one dense buffer in
-the slab's local ``[component][x][y][z]`` order, together with a small region
-record (start, size, offsets). The kernel applies the flux recurrence around the
-Yee E and H updates, component by component. A packed ``float4`` spans four z
-positions, so each of its lanes is filtered by the slab's z range; lanes outside
-the slab keep the identity and are left untouched. Regions never overlap in
-``(x, y)``, so a cell belongs to at most one slab. Coefficients and flux are
-ordinary shared buffers. Once the coefficients and flux are uploaded, the
-operator's dense arrays and the extension's CPU flux are released for the run,
-because the CPU UPML hooks never execute in diamond mode; the operator arrays
-are rebuilt from the shared buffer on teardown. The diamond storage is dense
-and not dictionary-compressed.
+coefficient arrays and its two flux arrays are wrapped in place with
+``newBufferWithBytesNoCopy``; nothing is copied and the operator keeps ownership.
+The arrays are the same dense local ``[component][x][y][z]`` layout the CPU hooks
+use, so the kernel reads them via an argument buffer of per-slab array pointers
+plus a small region record (start, size). That keeps it to one coefficient
+binding and one flux binding instead of one per array. The kernel applies the
+flux recurrence around the Yee E and H updates, component by component. A packed
+``float4`` spans four z positions, so each of its lanes is filtered by the
+slab's z range; lanes outside the slab keep the identity and are left untouched.
+Regions never overlap in ``(x, y)``, so a cell belongs to at most one slab.
 
 The diamond path reproduces the legacy GPU conditioners bit for bit: the same
 local update, in the same CPU order (pre in reverse extension order, post
